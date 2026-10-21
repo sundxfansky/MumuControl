@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../../src/MumuControl.Core/MumuControl.Core.csproj" />
+    <Compile Include="../../src/MumuControl/AccessSecurity.cs" Link="AccessSecurity.cs" />
+    <Compile Include="../../src/MumuControl/LocalServer.cs" Link="LocalServer.cs" />
+    <Compile Include="../../src/MumuControl/StartupManager.cs" Link="StartupManager.cs" />
+    <EmbeddedResource Include="../../src/MumuControl/wwwroot/*" LogicalName="MumuControl.wwwroot.%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

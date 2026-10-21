@@ -1,0 +1,22 @@
+# 本地 SDK 与包缓存
+.tools/
+dotnet-sdk.zip
+
+# 构建产物
+**/bin/
+**/obj/
+dist/
+dist-*/
+artifacts/
+
+# 本地测试与参考资料
+.testdata*
+mumu-api-reference.html
+
+# 编辑器与日志
+.vs/
+.vscode/
+.idea/
+.claude/
+*.user
+*.log
