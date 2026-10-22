@@ -46,7 +46,6 @@ public sealed class AppEngine : IAsyncDisposable
     private readonly SemaphoreSlim _captureGate = new(1, 1);
     private readonly object _viewLock = new();
     private readonly Queue<LogEntry> _logs = new();
-    private readonly HashSet<int> _pendingTimerBindings = [];
     private readonly Dictionary<int, DateTimeOffset> _unverifiedTimerRetryAt = [];
     private readonly CancellationTokenSource _shutdown = new();
     private readonly DateTimeOffset _createdAt;
@@ -162,36 +161,8 @@ public sealed class AppEngine : IAsyncDisposable
                     _updatedAt = now;
                 }
                 if (!wasConnected) Log("info", $"已连接 MuMu，发现 {list.Count} 个模拟器。");
-                var timers = _document.AutoStops.ToList();
-                bool changed = false;
-                foreach (var item in timers.ToArray())
-                {
-                    var vm = list.FirstOrDefault(v => v.Index == item.VmIndex);
-                    if (item.Pid == 0)
-                    {
-                        // Only launch intents created by this engine can bind to a first PID.
-                        // A restored PID-less timer cannot prove which process was originally launched.
-                        var inStartupWindow = now - item.CreatedAt <= TimeSpan.FromSeconds(90);
-                        var knownLaunch = _pendingTimerBindings.Contains(item.VmIndex);
-                        if (vm is not null && vm.Status is "running" or "starting" && vm.Pid > 0 && inStartupWindow && knownLaunch)
-                        {
-                            timers[timers.IndexOf(item)] = item with { Pid = vm.Pid };
-                            changed = true;
-                            continue;
-                        }
-                        if (knownLaunch && vm is not null && vm.Status is "stopped" or "starting" or "unknown" && inStartupWindow) continue;
-                    }
-                    else if (vm is not null && vm.Status is not ("stopped" or "stopping")
-                        && (vm.Pid <= 0 || item.Pid == vm.Pid)
-                        && (vm.StartedAt is null || vm.StartedAt <= item.CreatedAt.AddSeconds(90)))
-                    {
-                        continue;
-                    }
-                    timers.Remove(item);
-                    changed = true;
-                    Log("info", $"#{item.VmIndex} 已停止、更换运行会话或无法确认原启动进程，已取消旧倒计时。");
-                }
-                if (changed) await CommitAsync(_document with { AutoStops = timers }, ct);
+                // Countdowns are bound to the emulator index only. Polling never cancels them:
+                // PID changes, slow launches and app restarts must not drop a scheduled stop.
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -237,10 +208,6 @@ public sealed class AppEngine : IAsyncDisposable
                 timers.Add(new(index, now.AddMinutes(minutes), alreadyActive ? vm.Pid : 0, now));
             // Once MuMu accepted the command, a disconnected HTTP caller must not cancel persistence.
             await CommitAsync(_document with { AutoStops = timers }, CancellationToken.None);
-            if (action == "start" && durationMinutes is not null && (!alreadyActive || vm.Pid <= 0))
-                _pendingTimerBindings.Add(index);
-            else if (action == "stop" || durationMinutes is not null || !alreadyActive)
-                _pendingTimerBindings.Remove(index);
             if (action == "stop" || durationMinutes is not null || !alreadyActive)
                 _unverifiedTimerRetryAt.Remove(index);
             lock (_viewLock)
@@ -270,8 +237,6 @@ public sealed class AppEngine : IAsyncDisposable
             var now = _clock.GetUtcNow();
             if (minutes is {} m) timers.Add(new(index, now.AddMinutes(m), vm.Pid, now));
             await CommitAsync(_document with { AutoStops = timers }, ct);
-            if (minutes is not null && vm.Pid <= 0) _pendingTimerBindings.Add(index);
-            else _pendingTimerBindings.Remove(index);
             _unverifiedTimerRetryAt.Remove(index);
             Log("info", $"#{index} " + (minutes is {} duration ? $"将在 {duration} 分钟后停止。" : "已取消倒计时。"));
         }
@@ -320,21 +285,24 @@ public sealed class AppEngine : IAsyncDisposable
             now = _clock.GetUtcNow();
             foreach (var timer in _document.AutoStops.Where(a => IsAutoStopDue(a, now)).ToArray())
             {
+                // While MuMu is unreachable the timer stays due and runs as soon as it reconnects.
                 if (!_connected) continue;
                 var vm = _vms.FirstOrDefault(v => v.Index == timer.VmIndex);
-                if (vm is null || vm.Status is "stopped" or "stopping" || (timer.Pid > 0 && vm.Pid > 0 && vm.Pid != timer.Pid))
+                if (vm is null || vm.Status == "stopped")
                 {
                     await CommitAsync(_document with { AutoStops = _document.AutoStops.Where(a => a.VmIndex != timer.VmIndex).ToList() }, ct);
+                    Log("info", vm is null ? $"#{timer.VmIndex} 模拟器已不存在，倒计时结束。" : $"#{timer.VmIndex} {vm.Name} 已处于停止状态，倒计时结束。");
                     continue;
                 }
-                if (vm.Status is not ("running" or "starting") || timer.Pid <= 0 || vm.Pid <= 0)
+                if (vm.Status == "stopping")
                 {
-                    // Missing PID/state is not a command failure. Keep this short backoff only in
-                    // memory, so a waiting timer neither launches a CLI every second nor writes disk.
+                    // Already shutting down: re-check next poll instead of sending a second stop.
                     _unverifiedTimerRetryAt[timer.VmIndex] = now.AddSeconds(Settings.PollIntervalSeconds);
                     continue;
                 }
                 _unverifiedTimerRetryAt.Remove(timer.VmIndex);
+                Log("info", $"#{timer.VmIndex} {vm.Name} 倒计时到期，执行自动停止。");
+                // Any non-stopped state (running, starting, unknown) is stopped by index.
                 try { await ControlLockedAsync(timer.VmIndex, "stop", null, ct); }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -443,7 +411,6 @@ public sealed class AppEngine : IAsyncDisposable
     {
         await _store.SaveAsync(document, ct);
         lock (_viewLock) _document = document;
-        _pendingTimerBindings.RemoveWhere(index => !document.AutoStops.Any(a => a.VmIndex == index && a.Pid == 0));
         foreach (var index in _unverifiedTimerRetryAt.Keys.Where(index => !document.AutoStops.Any(a => a.VmIndex == index)).ToArray())
             _unverifiedTimerRetryAt.Remove(index);
     }

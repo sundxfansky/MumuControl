@@ -8,18 +8,21 @@ var cases = new List<(string Name, Func<Task> Run)>
     ("CLI error envelopes and malformed output are rejected", Tests.ParseErrors),
     ("Start countdown stops exactly once", Tests.StartCountdown),
     ("Countdown survives application restart", Tests.RestoreCountdown),
-    ("PID change cancels old session countdown", Tests.PidChange),
+    ("PID change keeps countdown bound to the emulator index", Tests.PidChange),
+    ("Slow launch without PID keeps countdown", Tests.SlowLaunchKeepsCountdown),
+    ("Instance stopped before due time clears countdown", Tests.StoppedBeforeDueClearsCountdown),
+    ("Stopping instance defers without duplicate stop", Tests.StoppingDefersWithoutDuplicateStop),
     ("One-time schedule executes exactly once across restart", Tests.OnceSchedule),
     ("Daily schedule executes once per day", Tests.DailySchedule),
     ("Schedules missed by more than five minutes are skipped", Tests.MissedSchedule),
     ("Failed automatic stop retries with backoff", Tests.StopRetry),
     ("Disconnected state defers stop until recovery", Tests.ConnectionRecovery),
     ("State backup recovers damaged primary document", Tests.BackupRecovery),
-    ("Expired timer rechecks current PID before stopping", Tests.FreshPidBeforeStop),
+    ("Expired timer stops by index despite stale cached PID", Tests.FreshPidBeforeStop),
     ("Repeated stop preserves stopped status", Tests.RepeatedStop),
     ("Plain start preserves existing countdown", Tests.PreserveTimerOnStart),
-    ("Restart cannot bind an unconfirmed countdown to another session", Tests.RestoredUnconfirmedTimer),
-    ("Missing PID countdown retries at poll interval without disk writes", Tests.MissingPidBackoff),
+    ("Countdown survives app restart before PID is known", Tests.RestoredUnconfirmedTimer),
+    ("Missing PID does not block a due countdown", Tests.MissingPidBackoff),
     ("Unknown emulator uptime remains null", Tests.UnknownUptime),
     ("Renderer frames are flipped upright and downscaled", () => { Tests.ThumbnailFlip(); return Task.CompletedTask; })
 };
@@ -87,7 +90,7 @@ internal static class Tests
         await f.Engine.ControlAsync(2, "start", 30);
         Equal(1, f.Client.Count("start"));
         await f.Engine.RefreshAsync();
-        Equal(f.Client.Vm.Pid, f.Store.Load().AutoStops.Single().Pid);
+        Equal(1, f.Store.Load().AutoStops.Count);
         f.Clock.Advance(TimeSpan.FromMinutes(29));
         await f.Engine.TickAsync();
         Equal(0, f.Client.Count("stop"));
@@ -117,12 +120,14 @@ internal static class Tests
     {
         await using var f = await Fixture.Create(running: true);
         await f.Engine.SetAutoStopAsync(2, 30);
+        // MuMu reports a different PID (restart, process swap): the countdown is bound to the index.
         f.Client.Vm = f.Client.Vm with { Pid = 999, StartedAt = f.Clock.GetUtcNow().AddSeconds(1) };
         await f.Engine.RefreshAsync();
-        Equal(0, f.Store.Load().AutoStops.Count);
-        f.Clock.Advance(TimeSpan.FromHours(1));
+        Equal(1, f.Store.Load().AutoStops.Count);
+        f.Clock.Advance(TimeSpan.FromMinutes(30));
         await f.Engine.TickAsync();
-        Equal(0, f.Client.Count("stop"));
+        Equal(1, f.Client.Count("stop"));
+        Equal(0, f.Store.Load().AutoStops.Count);
     }
 
     public static async Task OnceSchedule()
@@ -243,7 +248,34 @@ internal static class Tests
         await f.Engine.SetAutoStopAsync(2, 1);
         f.Clock.Advance(TimeSpan.FromMinutes(1));
         f.Client.Vm = f.Client.Vm with { Pid = 999, StartedAt = f.Clock.GetUtcNow() };
-        // Do not refresh the engine: its cached PID deliberately belongs to the previous session.
+        // The cached PID is stale; the due countdown still stops the instance by index.
+        await f.Engine.TickAsync();
+        Equal(1, f.Client.Count("stop"));
+        Equal(0, f.Store.Load().AutoStops.Count);
+    }
+
+    public static async Task SlowLaunchKeepsCountdown()
+    {
+        await using var f = await Fixture.Create();
+        await f.Engine.ControlAsync(2, "start", 30);
+        // Android takes longer than any startup grace period to report a PID.
+        f.Client.Vm = f.Client.Vm with { Status = "starting", Pid = 0, StartedAt = null };
+        f.Clock.Advance(TimeSpan.FromMinutes(5));
+        await f.Engine.RefreshAsync();
+        Equal(1, f.Store.Load().AutoStops.Count);
+        f.Client.Vm = f.Client.Vm with { Status = "running", Pid = 4242, StartedAt = f.Clock.GetUtcNow() };
+        f.Clock.Advance(TimeSpan.FromMinutes(25));
+        await f.Engine.TickAsync();
+        Equal(1, f.Client.Count("stop"));
+        Equal(0, f.Store.Load().AutoStops.Count);
+    }
+
+    public static async Task StoppedBeforeDueClearsCountdown()
+    {
+        await using var f = await Fixture.Create(running: true);
+        await f.Engine.SetAutoStopAsync(2, 30);
+        f.Client.Vm = f.Client.Vm with { Status = "stopped", Pid = 0, StartedAt = null };
+        f.Clock.Advance(TimeSpan.FromMinutes(30));
         await f.Engine.TickAsync();
         Equal(0, f.Client.Count("stop"));
         Equal(0, f.Store.Load().AutoStops.Count);
@@ -273,48 +305,53 @@ internal static class Tests
         await using var f = await Fixture.Create();
         await f.Engine.ControlAsync(2, "start", 30);
         Equal(0, f.Store.Load().AutoStops.Single().Pid);
-        // The process exits before the first confirmed PID. A later external launch must not
-        // inherit the previous session's timer merely because it was within startup grace.
+        // App restarts before MuMu reports a PID and the instance later shows a new PID.
+        // The countdown survives and still stops the instance at its due time.
         f.Clock.Advance(TimeSpan.FromSeconds(10));
         f.Client.Vm = f.Client.Vm with { Pid = 999, StartedAt = f.Clock.GetUtcNow() };
         await f.Restart();
-        Equal(0, f.Store.Load().AutoStops.Count);
-        f.Clock.Advance(TimeSpan.FromHours(1));
+        Equal(1, f.Store.Load().AutoStops.Count);
+        f.Clock.Advance(TimeSpan.FromMinutes(30));
         await f.Engine.TickAsync();
-        Equal(0, f.Client.Count("stop"));
+        Equal(1, f.Client.Count("stop"));
     }
 
     public static async Task MissingPidBackoff()
     {
         await using var f = await Fixture.Create(running: true);
         await f.Engine.SetAutoStopAsync(2, 1);
-        var originalPid = f.Client.Vm.Pid;
-        var statePath = Path.Combine(f.Directory, "state.json");
-        var unchangedDocument = await File.ReadAllTextAsync(statePath);
-        var unchangedWriteTime = File.GetLastWriteTimeUtc(statePath);
         f.Clock.Advance(TimeSpan.FromMinutes(1));
+        // A running instance without a reported PID is still stopped by index.
         f.Client.Vm = f.Client.Vm with { Pid = 0 };
-        var previousLists = f.Client.ListCalls;
         await f.Engine.TickAsync();
-        Equal(previousLists + 1, f.Client.ListCalls);
+        Equal(1, f.Client.Count("stop"));
+        Equal(0, f.Store.Load().AutoStops.Count);
+        await f.Engine.TickAsync();
+        Equal(1, f.Client.Count("stop"));
+    }
+
+    public static async Task StoppingDefersWithoutDuplicateStop()
+    {
+        await using var f = await Fixture.Create(running: true);
+        await f.Engine.SetAutoStopAsync(2, 1);
+        f.Clock.Advance(TimeSpan.FromMinutes(1));
+        f.Client.Vm = f.Client.Vm with { Status = "stopping" };
+        var lists = f.Client.ListCalls;
+        await f.Engine.TickAsync();
         Equal(0, f.Client.Count("stop"));
+        Equal(1, f.Store.Load().AutoStops.Count);
         for (int seconds = 1; seconds < 5; seconds++)
         {
             f.Clock.Advance(TimeSpan.FromSeconds(1));
             await f.Engine.TickAsync();
-            Equal(previousLists + 1, f.Client.ListCalls);
         }
-        Equal(unchangedDocument, await File.ReadAllTextAsync(statePath));
-        Equal(unchangedWriteTime, File.GetLastWriteTimeUtc(statePath));
-        f.Client.Vm = f.Client.Vm with { Pid = originalPid };
+        Equal(lists + 1, f.Client.ListCalls);
+        // Shutdown stalled and the instance is back to running: the countdown stops it.
+        f.Client.Vm = f.Client.Vm with { Status = "running" };
         f.Clock.Advance(TimeSpan.FromSeconds(1));
         await f.Engine.TickAsync();
-        Equal(previousLists + 2, f.Client.ListCalls);
         Equal(1, f.Client.Count("stop"));
         Equal(0, f.Store.Load().AutoStops.Count);
-        await f.Engine.TickAsync();
-        Equal(previousLists + 2, f.Client.ListCalls);
-        Equal(1, f.Client.Count("stop"));
     }
 
     public static async Task UnknownUptime()
