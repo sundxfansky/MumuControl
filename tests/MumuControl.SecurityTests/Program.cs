@@ -62,24 +62,30 @@ try
     try
     {
         var bootstrap = await Json(await local.GetAsync("/api/bootstrap"));
-        var setupToken = bootstrap["token"]!.GetValue<string>();
-        Check(bootstrap["local"]!.GetValue<bool>() && !bootstrap["initialized"]!.GetValue<bool>(), "local setup only before initialization");
+        var token = bootstrap["token"]!.GetValue<string>();
+        Check(bootstrap["local"]!.GetValue<bool>() && bootstrap["authenticated"]!.GetValue<bool>() && !bootstrap["initialized"]!.GetValue<bool>(), "local access is authenticated without any account");
         Check(!await Listening(remotePort), "remote socket closed before initialization");
-        foreach (var path in new[] { "/api/state", "/api/logs", "/api/settings", "/api/health", "/api/emulators/2/screenshot", "/api/startup" })
-            Check((await anonymous.GetAsync(path)).StatusCode == HttpStatusCode.Unauthorized, "anonymous denied " + path);
+        foreach (var path in new[] { "/api/state", "/api/logs", "/api/settings", "/api/health", "/api/startup" })
+            Check((await anonymous.GetAsync(path)).IsSuccessStatusCode, "local access needs no login " + path);
+        Check(!(await anonymous.GetAsync("/")).Headers.Contains("Set-Cookie") && !(await anonymous.GetAsync("/api/state")).Headers.Contains("Set-Cookie"), "local access issues no session cookie");
         var asset = await anonymous.GetAsync("/");
-        Check(asset.IsSuccessStatusCode && asset.Headers.CacheControl?.NoStore == true && asset.Headers.Contains("Content-Security-Policy"), "login shell with no-store and CSP");
-        Check((await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false })).StatusCode == HttpStatusCode.Forbidden, "setup requires local CSRF token");
-        Check((await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false }, setupToken, "https://evil.example")).StatusCode == HttpStatusCode.Forbidden, "cross-origin initialization denied");
-        Check((await Write(local, "POST", "/api/auth/setup", new { username, password = "short", remoteEnabled = false }, setupToken)).StatusCode == HttpStatusCode.BadRequest, "weak password rejected");
-        var setup = await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false }, setupToken);
+        Check(asset.IsSuccessStatusCode && asset.Headers.CacheControl?.NoStore == true && asset.Headers.Contains("Content-Security-Policy"), "page shell with no-store and CSP");
+        Check((await Write(local, "POST", "/api/refresh", new { })).StatusCode == HttpStatusCode.Forbidden, "local writes still require the page CSRF token");
+        Check((await Write(local, "POST", "/api/refresh", new { }, token, "https://evil.example")).StatusCode == HttpStatusCode.Forbidden, "cross-origin local write denied");
+        var crossSiteLocal = new HttpRequestMessage(HttpMethod.Get, "/api/state"); crossSiteLocal.Headers.Add("Sec-Fetch-Site", "cross-site");
+        Check((await local.SendAsync(crossSiteLocal)).StatusCode == HttpStatusCode.Forbidden, "cross-site local read denied");
+        Check((await Write(local, "POST", "/api/refresh", new { }, token)).IsSuccessStatusCode, "local write with page token");
+        Check((await Write(local, "PUT", "/api/access", new { remoteEnabled = true, remotePort }, token)).StatusCode == HttpStatusCode.Conflict && !await Listening(remotePort), "remote access cannot be enabled before the remote account exists");
+        Check((await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false })).StatusCode == HttpStatusCode.Forbidden, "account creation requires local CSRF token");
+        Check((await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false }, token, "https://evil.example")).StatusCode == HttpStatusCode.Forbidden, "cross-origin account creation denied");
+        Check((await Write(local, "POST", "/api/auth/setup", new { username, password = "short", remoteEnabled = false }, token)).StatusCode == HttpStatusCode.BadRequest, "weak password rejected");
+        var setup = await Write(local, "POST", "/api/auth/setup", new { username, password, remoteEnabled = false }, token);
         var status = await Json(setup);
-        var token = status["token"]!.GetValue<string>();
-        Check(setup.IsSuccessStatusCode && status["authenticated"]!.GetValue<bool>(), "local initialization creates session");
-        Check(setup.Headers.GetValues("Set-Cookie").Single().Contains("httponly", StringComparison.OrdinalIgnoreCase), "local session cookie HttpOnly");
-        Check((await Write(local, "POST", "/api/auth/setup", new { username, password }, setupToken)).StatusCode == HttpStatusCode.Conflict, "initialization is one time");
-        Check((await local.GetAsync("/api/state")).IsSuccessStatusCode, "authenticated local state");
-        Check((await Write(local, "POST", "/api/refresh", new { })).StatusCode == HttpStatusCode.Forbidden, "authenticated mutations require session CSRF");
+        Check(setup.IsSuccessStatusCode && status["initialized"]!.GetValue<bool>() && status["token"]!.GetValue<string>() == token, "local account creation keeps the same local session");
+        Check(!setup.Headers.Contains("Set-Cookie"), "account creation sets no cookie");
+        Check((await Write(local, "POST", "/api/auth/setup", new { username, password }, token)).StatusCode == HttpStatusCode.Conflict, "account creation is one time");
+        Check((await local.GetAsync("/api/state")).IsSuccessStatusCode, "local state after account creation");
+        Check((await Write(local, "POST", "/api/auth/logout", new { }, token)).StatusCode == HttpStatusCode.BadRequest && (await local.GetAsync("/api/state")).IsSuccessStatusCode, "local access cannot be logged out");
         var forged = new HttpRequestMessage(HttpMethod.Get, "/api/bootstrap"); forged.Headers.Host = $"evil.example:{port}";
         Check((await anonymous.SendAsync(forged)).StatusCode == HttpStatusCode.Forbidden, "local DNS rebinding host rejected");
         var legacyCertificatePath = Path.Combine(directory, "security", "certificate.dpapi");
@@ -94,8 +100,10 @@ try
         var remoteStatus = await Json(await remote.GetAsync("/api/bootstrap"));
         Check(!remoteStatus["local"]!.GetValue<bool>() && remoteStatus["token"]!.GetValue<string>() == "", "remote HTTP listener never gains local administration even via loopback");
         Check((await remote.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "remote cannot read devices before login");
+        Check((await remote.GetAsync("/api/emulators/2/screenshot")).StatusCode == HttpStatusCode.Unauthorized && (await remote.GetAsync("/api/emulators/2/capture")).StatusCode == HttpStatusCode.Unauthorized, "remote cannot read captures before login");
+        Check((await Write(remote, "POST", "/api/refresh", new { }, token)).StatusCode == HttpStatusCode.Unauthorized, "local page token cannot authorize remote listener");
         var spoofed = new HttpRequestMessage(HttpMethod.Post, "/api/auth/setup") { Content = JsonContent.Create(new { username, password }) };
-        spoofed.Headers.Add("X-Mumu-Token", setupToken); spoofed.Headers.Add("X-Forwarded-For", "127.0.0.1");
+        spoofed.Headers.Add("X-Mumu-Token", token); spoofed.Headers.Add("X-Forwarded-For", "127.0.0.1");
         Check((await remote.SendAsync(spoofed)).StatusCode == HttpStatusCode.Forbidden, "remote setup denied including forged forwarded address");
         var bad = await Write(remote, "POST", "/api/auth/login", new { username = "missing", password });
         Check(bad.StatusCode == HttpStatusCode.Unauthorized && (await Json(bad))["error"]!.GetValue<string>() == "账户或密码不正确。", "login failure does not enumerate accounts");
@@ -103,17 +111,10 @@ try
         var remoteToken = (await Json(login))["token"]!.GetValue<string>();
         var cookie = login.Headers.GetValues("Set-Cookie").Single();
         Check(login.IsSuccessStatusCode && cookie.StartsWith("MumuRemoteSession=") && !cookie.Contains("secure", StringComparison.OrdinalIgnoreCase) && cookie.Contains("httponly", StringComparison.OrdinalIgnoreCase) && cookie.Contains("samesite=strict", StringComparison.OrdinalIgnoreCase), "direct HTTP remote login has separate host-only HttpOnly strict cookie");
-        using (var copiedLocal = Client($"http://127.0.0.1:{remotePort}"))
+        using (var forgedRemote = Client($"http://127.0.0.1:{remotePort}"))
         {
-            var localCookieValue = setup.Headers.GetValues("Set-Cookie").Single().Split(';')[0].Split('=', 2)[1];
-            copiedLocal.DefaultRequestHeaders.Add("Cookie", "MumuRemoteSession=" + localCookieValue);
-            Check((await copiedLocal.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "renaming local session cookie cannot authenticate remote listener");
-        }
-        using (var copiedRemote = Client($"http://127.0.0.1:{port}"))
-        {
-            var remoteCookieValue = cookie.Split(';')[0].Split('=', 2)[1];
-            copiedRemote.DefaultRequestHeaders.Add("Cookie", "MumuLocalSession=" + remoteCookieValue);
-            Check((await copiedRemote.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "renaming remote session cookie cannot authenticate local listener");
+            forgedRemote.DefaultRequestHeaders.Add("Cookie", "MumuRemoteSession=" + token);
+            Check((await forgedRemote.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "local page token as cookie cannot authenticate remote listener");
         }
         var remoteState = await Json(await remote.GetAsync("/api/state"));
         Check(remoteState["settings"]!["managerPath"]!.GetValue<string>() == "" && remoteState["connection"]!["managerPath"] is null, "remote logged-in state omits local executable path");
@@ -136,9 +137,10 @@ try
         Check(startup.ContainsKey("supported"), "local startup status available without writing registry");
         var securityJson = File.ReadAllText(Path.Combine(directory, "security", "access.json"));
         Check(!securityJson.Contains(password) && securityJson.Contains("600000"), "salted password hash persisted without plaintext");
+        Check((await Write(local, "PUT", "/api/auth/credentials", new { username, password = newPassword, currentPassword = "wrong-password-1" }, token)).StatusCode == HttpStatusCode.Unauthorized, "credential change requires current password");
         var changed = await Write(local, "PUT", "/api/auth/credentials", new { username, password = newPassword, currentPassword = password }, token);
-        status = await Json(changed); token = status["token"]!.GetValue<string>();
         Check(changed.IsSuccessStatusCode && (await remote.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "local credential change invalidates remote sessions");
+        Check((await local.GetAsync("/api/state")).IsSuccessStatusCode, "local access unaffected by credential change");
         var relogin = await Write(remote, "POST", "/api/auth/login", new { username, password = newPassword });
         remoteToken = (await Json(relogin))["token"]!.GetValue<string>();
         Check((await Write(remote, "POST", "/api/auth/logout", new { }, remoteToken)).IsSuccessStatusCode && (await remote.GetAsync("/api/state")).StatusCode == HttpStatusCode.Unauthorized, "logout invalidates session");
@@ -166,7 +168,7 @@ try
         Check((await proxy.GetAsync("/api/state")).IsSuccessStatusCode, "reverse proxy relays authenticated cookie to backend HTTP");
         Check((await Write(proxy, "POST", "/api/refresh", new { }, proxyToken, "http://mumu.example.com")).StatusCode == HttpStatusCode.Forbidden, "public HTTPS origin rejects HTTP origin downgrade");
         var spoofedProxy = new HttpRequestMessage(HttpMethod.Post, "/api/auth/setup") { Content = JsonContent.Create(new { username, password }) };
-        spoofedProxy.Headers.Add("X-Mumu-Token", setupToken);
+        spoofedProxy.Headers.Add("X-Mumu-Token", token);
         spoofedProxy.Headers.Add("X-Forwarded-For", "127.0.0.1"); spoofedProxy.Headers.Add("X-Forwarded-Proto", "https");
         spoofedProxy.Headers.Add("Forwarded", "for=127.0.0.1;proto=https;host=127.0.0.1");
         Check((await proxy.SendAsync(spoofedProxy)).StatusCode == HttpStatusCode.Forbidden, "proxy headers cannot authorize local account setup");
@@ -197,9 +199,14 @@ try
         await restarted.StartAsync();
         using var recovered = Client($"http://127.0.0.1:{port}");
         var status = await Json(await recovered.GetAsync("/api/bootstrap"));
-        Check(status["initialized"]!.GetValue<bool>() && !status["authenticated"]!.GetValue<bool>() && !status["remoteEnabled"]!.GetValue<bool>(), "restart retains credentials and disabled access but no sessions");
-        Check((await Write(recovered, "POST", "/api/auth/login", new { username, password = newPassword })).IsSuccessStatusCode, "new password survives restart");
-        using var stalePasswordClient = Client($"http://127.0.0.1:{port}");
+        var restartedToken = status["token"]!.GetValue<string>();
+        Check(status["initialized"]!.GetValue<bool>() && status["authenticated"]!.GetValue<bool>() && !status["remoteEnabled"]!.GetValue<bool>(), "restart retains account and disabled remote access; local stays login-free");
+        Check(restartedToken.Length == 64, "local page token is regenerated on restart");
+        var reenabled = await Write(recovered, "PUT", "/api/access", new { remoteEnabled = true, remotePort }, restartedToken);
+        Check(reenabled.IsSuccessStatusCode && await Listening(remotePort), "remote access re-enabled after restart");
+        using var remoteAfterRestart = Client($"http://127.0.0.1:{remotePort}");
+        Check((await Write(remoteAfterRestart, "POST", "/api/auth/login", new { username, password = newPassword })).IsSuccessStatusCode, "new password survives restart");
+        using var stalePasswordClient = Client($"http://127.0.0.1:{remotePort}");
         Check((await Write(stalePasswordClient, "POST", "/api/auth/login", new { username, password })).StatusCode == HttpStatusCode.Unauthorized, "old password remains rejected after restart");
     }
     var fakeRegistry = new MemoryRegistry();

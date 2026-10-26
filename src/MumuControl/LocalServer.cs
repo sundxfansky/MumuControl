@@ -111,17 +111,19 @@ public sealed class LocalServer : IAsyncDisposable
             var path = request.Path.Value ?? "/";
             if (!path.StartsWith("/api/", StringComparison.Ordinal))
             { await ServeAssetAsync(context, path); return; }
-            var session = _access.FindSession(request.Cookies[CookieName(local)], local, ip);
+            // The loopback management entry (local desktop window and local browser) needs no login.
+            // The remote listener always requires the account password.
+            var session = local ? _access.LocalSession : _access.FindSession(request.Cookies[CookieName(local)], local, ip);
             if (request.Method == "GET" && path is "/api/bootstrap" or "/api/auth/status")
             { await response.WriteAsJsonAsync(Status(local, session), context.RequestAborted); return; }
             if (path == "/api/auth/setup" && request.Method == "POST")
             {
                 if (!local) { await ErrorAsync(context, 403, "账户只能在运行程序的本机初始化。"); return; }
-                if (!AccessSecurity.TokenMatches(request.Headers["X-Mumu-Token"], _access.SetupToken))
+                if (!AccessSecurity.TokenMatches(request.Headers["X-Mumu-Token"], _access.LocalSession.Token))
                 { await ErrorAsync(context, 403, "初始化验证失败，请刷新本机页面。"); return; }
                 var setup = await BodyAsync<SetupInput>(request, context.RequestAborted);
-                var initialized = await _access.InitializeAsync(setup.Username ?? "", setup.Password ?? "", setup.RemoteEnabled, ip);
-                SetCookie(context, initialized);
+                await _access.InitializeAsync(setup.Username ?? "", setup.Password ?? "", setup.RemoteEnabled, ip);
+                var initialized = _access.LocalSession;
                 if (setup.RemoteEnabled)
                 {
                     try { await StartRemoteAsync(_access.RemotePort, CancellationToken.None); }
@@ -135,6 +137,7 @@ public sealed class LocalServer : IAsyncDisposable
             }
             if (path == "/api/auth/login" && request.Method == "POST")
             {
+                if (local) { await response.WriteAsJsonAsync(Status(local, session)); return; }
                 var input = await BodyAsync<LoginInput>(request, context.RequestAborted);
                 var loggedIn = await _access.LoginAsync(input.Username ?? "", input.Password ?? "", local, ip);
                 if (loggedIn is null) { await ErrorAsync(context, 401, "账户或密码不正确。"); return; }
@@ -147,6 +150,7 @@ public sealed class LocalServer : IAsyncDisposable
             { await ErrorAsync(context, 403, "会话验证失败，请刷新页面后重试。"); return; }
             if (path == "/api/auth/logout" && request.Method == "POST")
             {
+                if (local) { await ErrorAsync(context, 400, "本机访问无需登录，也无法退出登录。"); return; }
                 _access.Logout(session);
                 response.Cookies.Delete(CookieName(local), CookieOptions(local));
                 await response.WriteAsJsonAsync(new { ok = true }); return;
@@ -171,9 +175,9 @@ public sealed class LocalServer : IAsyncDisposable
             if (path == "/api/auth/credentials" && request.Method == "PUT")
             {
                 var input = await BodyAsync<CredentialInput>(request, context.RequestAborted);
-                var changed = await _access.ChangeCredentialsAsync(input.Username ?? "", input.Password ?? "", input.CurrentPassword ?? "", ip);
-                SetCookie(context, changed);
-                await response.WriteAsJsonAsync(Status(local, changed)); return;
+                // Only the local port reaches this point; the change revokes every remote session.
+                await _access.ChangeCredentialsAsync(input.Username ?? "", input.Password ?? "", input.CurrentPassword ?? "", ip);
+                await response.WriteAsJsonAsync(Status(local, session)); return;
             }
             if (path == "/api/startup")
             {
@@ -343,7 +347,7 @@ public sealed class LocalServer : IAsyncDisposable
             isLocal = local,
             local,
             username = session is null ? null : _access.Username,
-            token = session?.Token ?? (local && !_access.Initialized ? _access.SetupToken : ""),
+            token = session?.Token ?? "",
             remoteEnabled = _access.RemoteEnabled && _remoteApp is not null,
             remotePort = _access.RemotePort,
             publicOrigin = admin ? _access.PublicOrigin : "",

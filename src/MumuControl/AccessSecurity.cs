@@ -27,7 +27,11 @@ public sealed class AccessSecurity : IDisposable
     private readonly byte[] _dummyHash = RandomNumberGenerator.GetBytes(32);
     private AccessDocument _document;
     private long _remoteSessionGeneration;
-    public string SetupToken { get; } = NewToken();
+    /// <summary>
+    /// Requests on the loopback management port need no password. They share this one in-memory
+    /// session; its token is still required on writes (CSRF) and changes on every restart.
+    /// </summary>
+    public AccessSession LocalSession { get; } = new(NewToken(), NewToken(), true, "127.0.0.1", DateTimeOffset.UtcNow, DateTimeOffset.MaxValue);
     public bool Initialized { get { lock (_sync) return _document.Username is not null; } }
     public bool RemoteEnabled { get { lock (_sync) return _document.RemoteEnabled && _document.Username is not null; } }
     public int RemotePort { get { lock (_sync) return _document.RemotePort; } }
@@ -62,7 +66,8 @@ public sealed class AccessSecurity : IDisposable
         return data;
     }
 
-    public async Task<AccessSession> InitializeAsync(string username, string password, bool remoteEnabled, string ip)
+    /// <summary>Creates the account used by remote access. Local access never needs it.</summary>
+    public async Task InitializeAsync(string username, string password, bool remoteEnabled, string ip)
     {
         ValidateCredentials(username, password);
         if (!await _credentialGate.WaitAsync(0)) throw new AccessLimitException();
@@ -76,8 +81,7 @@ public sealed class AccessSecurity : IDisposable
                 Save(next);
                 _document = next;
             }
-            Audit("账户已在本机初始化；远程访问" + (remoteEnabled ? "已启用" : "未启用"), ip);
-            return CreateSession(true, ip);
+            Audit("远程访问账户已在本机创建；远程访问" + (remoteEnabled ? "已启用" : "未启用"), ip);
         }
         finally { _credentialGate.Release(); }
     }
@@ -103,7 +107,7 @@ public sealed class AccessSecurity : IDisposable
         finally { _credentialGate.Release(); }
     }
 
-    public async Task<AccessSession> ChangeCredentialsAsync(string username, string password, string currentPassword, string ip)
+    public async Task ChangeCredentialsAsync(string username, string password, string currentPassword, string ip)
     {
         ValidateCredentials(username, password);
         if (currentPassword.Length > 128) throw new ArgumentException("当前密码不正确。");
@@ -126,8 +130,7 @@ public sealed class AccessSecurity : IDisposable
                 _remoteSessionGeneration++;
                 _failures.Remove(FailureKey(ip, local: true));
             }
-            Audit("账户凭据已在本机修改，所有旧会话失效", ip);
-            return CreateSession(true, ip);
+            Audit("账户凭据已在本机修改，所有远程会话失效", ip);
         }
         finally { _credentialGate.Release(); }
     }

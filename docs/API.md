@@ -1,17 +1,17 @@
 # 控制接口
 
-默认本机地址 `http://127.0.0.1:17830`。初始化后可以从本机启用独立远程 HTTP，默认端口 `17831`，可由用户反向代理提供 HTTPS。仅本机入口允许账户初始化和管理；通过远程端口的回环连接也不享有本机权限。Host、实际连接地址与同源校验不信任 `Forwarded`、`X-Forwarded-*`。
+默认本机地址 `http://127.0.0.1:17830`，免登录。创建远程访问账户后可以从本机启用独立远程 HTTP，默认端口 `17831`，可由用户反向代理提供 HTTPS。仅本机入口允许创建账户和管理设置；通过远程端口的回环连接也不享有本机权限。Host、实际连接地址与同源校验不信任 `Forwarded`、`X-Forwarded-*`。
 
-先 `GET /api/bootstrap` 读取认证状态。未初始化时只有本机返回初始化 `token`，用其提交 `POST /api/auth/setup`。初始化后通过 `POST /api/auth/login` 登录，服务器写 HttpOnly 会话 Cookie 并返回会话 `token`。除了登录，写请求附带 `X-Mumu-Token` 和 `Content-Type: application/json`，读取设备/截图等也必须携带有效 Cookie。错误格式为 `{ "error": "中文说明" }`，未登录 401，本机权限或 CSRF 失败 403，登录限速 429（`Retry-After`）。
+先 `GET /api/bootstrap` 读取认证状态。本机入口始终 `authenticated: true`，返回本次运行有效的 `token`，不使用 Cookie；远程入口通过 `POST /api/auth/login` 登录，服务器写 HttpOnly 会话 Cookie 并返回会话 `token`。写请求（登录除外）都要附带 `X-Mumu-Token` 和 `Content-Type: application/json`；远程读取设备、截图等也必须携带有效 Cookie。错误格式为 `{ "error": "中文说明" }`，远程未登录 401，本机权限或 CSRF 失败 403，登录限速 429（`Retry-After`）。
 
 | 方法 | 路径 | 内容 |
 |---|---|---|
-| GET | `/api/bootstrap` 或 `/api/auth/status` | initialized、authenticated、local、token、远程状态；仅本机已登录时返回 publicOrigin、remoteUrls |
-| POST | `/api/auth/setup` | 仅本机；`{username,password,remoteEnabled:false}`，只允许初始化一次 |
-| POST | `/api/auth/login` | `{username,password}`，账户/密码错误统一提示 |
-| POST | `/api/auth/logout` | `{}`，撤销当前会话 |
-| PUT | `/api/auth/credentials` | 仅本机已登录；`{username,password,currentPassword}`，更换凭据使全部旧会话失效 |
-| GET/PUT | `/api/access` 或 `/api/auth/settings` | 仅本机已登录；`{remoteEnabled,remotePort,publicOrigin}`，立即生效；publicOrigin 省略保留，空字符串清除 |
+| GET | `/api/bootstrap` 或 `/api/auth/status` | initialized（是否已创建远程访问账户）、authenticated、local、token、远程状态；仅本机返回 publicOrigin、remoteUrls |
+| POST | `/api/auth/setup` | 仅本机；创建远程访问账户 `{username,password,remoteEnabled:false}`，只允许一次 |
+| POST | `/api/auth/login` | 远程入口；`{username,password}`，账户/密码错误统一提示（本机入口直接返回已认证状态） |
+| POST | `/api/auth/logout` | 远程入口；`{}`，撤销当前会话 |
+| PUT | `/api/auth/credentials` | 仅本机；`{username,password,currentPassword}`，更换凭据使全部远程会话失效 |
+| GET/PUT | `/api/access` 或 `/api/auth/settings` | 仅本机；启用前须已创建账户；`{remoteEnabled,remotePort,publicOrigin}`，立即生效；publicOrigin 省略保留，空字符串清除 |
 | GET/PUT | `/api/startup` | 仅本机已登录；读取 enabled/supported/reason，保存 `{enabled}` |
 
 | 方法 | 路径 | 内容 |

@@ -85,7 +85,13 @@
     if (mode !== 'blocked') setTimeout(() => (mode === 'setup' ? $('setup-username') : $('login-username'))?.focus(), 30);
   }
   function hideAuthGate() { $('auth-gate')?.classList.add('hidden'); document.querySelector('.app-shell').inert = false; document.body.classList.remove('auth-pending'); }
-  function applyAuth(data) { auth = { ...auth, ...(data || {}), local: data?.local ?? data?.isLocal ?? auth.local }; if (data?.token) token = data.token; if (auth.authenticated) hideAuthGate(); $('access-label').textContent = auth.local ? '本机安全会话' : '远程安全会话'; renderAccess(); }
+  function applyAuth(data) {
+    auth = { ...auth, ...(data || {}), local: data?.local ?? data?.isLocal ?? auth.local }; if (data?.token) token = data.token; if (auth.authenticated) hideAuthGate();
+    $('access-label').textContent = auth.local ? '本机访问 · 免登录' : '远程安全会话';
+    // Local access has no login, so there is nothing to log out of.
+    $('logout-button').classList.toggle('hidden', auth.local); $('logout-settings').classList.toggle('hidden', auth.local);
+    renderAccess();
+  }
   function renderAccess() {
     const enabled = Boolean(auth.remoteEnabled); const details = $('access-details'); if (!details) return;
     if (!accessDirty) { $('access-enabled').checked = enabled; $('access-port').value = auth.remotePort || 17831; $('access-origin').value = auth.publicOrigin || ''; } details.classList.toggle('hidden', !auth.local); $('access-status').textContent = enabled ? '远程 HTTP 服务已启用，使用账户密码登录；可通过自己的反向代理提供 HTTPS。' : '默认关闭。启用后使用下方访问地址登录。';
@@ -99,6 +105,14 @@
     });
     $('access-status').textContent = auth.local ? $('access-status').textContent : '账户与服务设置仅可在运行本程序的电脑上修改。';
     if (auth.local && auth.remoteError) $('access-status').textContent = auth.remoteError;
+    // The remote account is optional; until it exists the credential panel creates it and remote access stays off.
+    const hasAccount = Boolean(auth.initialized);
+    if (auth.local && !hasAccount) $('access-status').textContent = '本机访问无需登录。启用远程访问前，请先在下方创建远程访问账户。';
+    $('access-enabled').disabled = auth.local && !hasAccount && !demo;
+    $('credential-title').textContent = hasAccount ? '修改远程访问账户' : '创建远程访问账户';
+    $('credential-description').textContent = hasAccount ? '仅用于远程登录，本机访问无需密码。修改后所有远程会话立即失效。' : '仅用于远程登录，本机访问无需密码。创建后可在上方启用远程访问。';
+    $('credential-current-field').classList.toggle('hidden', !hasAccount);
+    $('save-credentials').textContent = hasAccount ? '更新账户密码' : '创建账户';
     document.querySelector('.credential-panel').classList.toggle('hidden', !auth.local && !demo); document.querySelector('.startup-panel').classList.toggle('hidden', !auth.local && !demo); $('save-access').classList.toggle('hidden', !auth.local && !demo); document.querySelector('.local-proxy-note').classList.toggle('hidden', !auth.local && !demo);
   }
   async function mutation(path, body = {}, method = 'POST') {
@@ -426,10 +440,18 @@
     catch (error) { toast(error.message, true); } finally { b.disabled = !startup.supported; }
   });
   $('save-credentials').addEventListener('click', async () => {
+    const creating = !auth.initialized;
     const currentPassword = $('credential-current').value, password = $('credential-password').value, username = $('credential-username').value.trim();
-    if (!currentPassword || !password || !username) { toast('请填写当前密码、账户名和新密码。', true); return; }
+    if ((!creating && !currentPassword) || !password || !username) { toast(creating ? '请填写账户名和密码。' : '请填写当前密码、账户名和新密码。', true); return; }
     const b = $('save-credentials'); b.disabled = true;
-    try { const saved = await api('/api/auth/credentials', { method: 'PUT', body: { username, password, currentPassword } }); applyAuth(saved); $('credential-username').value = saved.username || username; $('credential-current').value = ''; $('credential-password').value = ''; toast('账户凭据已更新'); }
+    try {
+      // Creating the remote account reuses the one-time setup endpoint; it never enables remote access by itself.
+      const saved = creating
+        ? await api('/api/auth/setup', { method: 'POST', body: { username, password, remoteEnabled: false } })
+        : await api('/api/auth/credentials', { method: 'PUT', body: { username, password, currentPassword } });
+      applyAuth(saved); $('credential-username').value = saved.username || username; $('credential-current').value = ''; $('credential-password').value = '';
+      toast(creating ? '远程访问账户已创建，现在可以启用远程访问。' : '账户凭据已更新，远程会话需重新登录。');
+    }
     catch (error) { toast(error.message, true); } finally { b.disabled = false; }
   });
   async function logout() { try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch (error) { if (error.status !== 401) { toast(`退出登录失败：${error.message}`, true); return; } } token = ''; auth = { ...auth, authenticated: false }; setAuthGate('login', '已退出登录。'); }
@@ -465,8 +487,8 @@
     }
     try {
       const bootstrap = await api('/api/bootstrap', { timeout: 15000 }); applyAuth(bootstrap);
-      if (!bootstrap.initialized) { setAuthGate(auth.local ? 'setup' : 'blocked'); return; }
-      if (!bootstrap.authenticated) { setAuthGate('login'); return; }
+      // Local access is always authenticated; only remote visitors see the login or "not set up" gate.
+      if (!bootstrap.authenticated) { setAuthGate(bootstrap.initialized ? 'login' : 'blocked'); return; }
     } catch (error) { setAuthGate('login', `无法连接认证服务：${error.message}`); return; }
     await refreshState(); schedulePoll();
   }
