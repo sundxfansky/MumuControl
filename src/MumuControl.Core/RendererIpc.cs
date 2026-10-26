@@ -37,7 +37,15 @@ internal sealed class RendererIpc : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            return await Task.Run(() => CaptureCore(managerPath, vm, maxSide), ct).ConfigureAwait(false);
+            var frame = await Task.Run(() => CaptureCore(managerPath, vm, maxSide), ct).ConfigureAwait(false);
+            DiagnosticLog.CountCapture(true);
+            return frame;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            DiagnosticLog.CountCapture(false);
+            DiagnosticLog.WriteThrottled("capture-" + vm.Index, TimeSpan.FromMinutes(5), "warning", $"#{vm.Index} 渲染器画面读取失败：{ex.GetType().Name} {ex.Message}");
+            throw;
         }
         finally { _gate.Release(); }
     }
@@ -57,6 +65,7 @@ internal sealed class RendererIpc : IDisposable
             var installRoot = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(managerPath)!, ".."));
             var handle = library.Connect(installRoot, vm.Index);
             if (handle == 0) throw new InvalidOperationException("无法连接模拟器渲染接口，请确认该实例已完成启动。");
+            DiagnosticLog.Write("info", $"#{vm.Index} 已连接渲染接口（句柄 {handle}，PID {vm.Pid}）");
             existing = new Connection(handle, vm.Pid);
             _connections[vm.Index] = existing;
         }
@@ -119,6 +128,7 @@ internal sealed class RendererIpc : IDisposable
             ?? throw new FileNotFoundException("未找到 MuMu 渲染接口 external_renderer_ipc.dll，当前版本可能不支持实时画面。");
         if (_library is not null && string.Equals(_library.Path, path, StringComparison.OrdinalIgnoreCase)) return _library;
         ReleaseAll();
+        DiagnosticLog.Write("info", "加载渲染接口 " + path);
         var module = NativeLibrary.Load(path);
         try
         {

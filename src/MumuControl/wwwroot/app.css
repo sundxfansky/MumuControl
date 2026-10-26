@@ -22,4 +22,8 @@
 .device-thumb{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .25s;z-index:1;cursor:zoom-in;background:#11121a}
 .device-thumb.ready{opacity:1}
 .device-visual:has(.device-thumb.ready) .device-monogram{visibility:hidden}
-.device-visual .preview-launch,.device-visual .status-badge{z-index:3}
+.device-visual .preview-launch,.device-visual .status-badge{z-index:3}.thumb-save{position:absolute;right:11px;top:9px;display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border-radius:6px;background:#ffffffc9;border:1px solid #ffffffb5;color:#8f86ad;z-index:3;cursor:pointer}
+.thumb-save svg{width:13px;height:13px}
+.thumb-save:hover{background:#fff;color:#8170c6}
+.thumb-save:disabled{opacity:.55;cursor:progress}
+.list-view .device-visual .thumb-save{right:6px;top:6px;width:21px;height:21px}

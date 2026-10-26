@@ -190,7 +190,7 @@ public sealed class MuMuClient : IMuMuClient
     {
         ThrowIfDisposed();
         if (vm.Status != "running") throw new InvalidOperationException("模拟器尚未启动完成，暂时无法读取画面。");
-        return _renderer.CaptureAsync(ValidateManagerPath(managerPath), vm, Math.Clamp(maxSide, 64, 1920), ct);
+        return _renderer.CaptureAsync(ValidateManagerPath(managerPath), vm, Math.Clamp(maxSide, 64, 4096), ct);
     }
 
     /// <summary>Accepts current dictionary results, older arrays, and nested data/results envelopes.</summary>
@@ -358,13 +358,21 @@ public sealed class MuMuClient : IMuMuClient
         using var cancellation = deadline.Token.Register(() => KillCommand(process));
         var stdout = ReadBoundedAsync(process.StandardOutput.BaseStream, maximumOutput, process, deadline.Token);
         var stderr = ReadBoundedAsync(process.StandardError.BaseStream, 64 * 1024, process, deadline.Token);
+        var watch = Stopwatch.StartNew();
+        // Status polls and screenshots repeat constantly; only control commands are logged every time.
+        bool routine = args.Count > 0 && args[0] is "info" or "-s" or "connect";
         try
         {
             await Task.WhenAll(stdout, stderr, process.WaitForExitAsync(deadline.Token)).ConfigureAwait(false);
-            return new CommandResult(process.ExitCode, await stdout.ConfigureAwait(false), Utf8.GetString(await stderr.ConfigureAwait(false)));
+            var result = new CommandResult(process.ExitCode, await stdout.ConfigureAwait(false), Utf8.GetString(await stderr.ConfigureAwait(false)));
+            var summary = $"{Path.GetFileName(executable)} {string.Join(' ', args)} → 退出码 {result.ExitCode}，{watch.ElapsedMilliseconds} ms，输出 {result.Stdout.Length} 字节";
+            if (result.ExitCode != 0) DiagnosticLog.Write("warning", summary + "，stderr：" + LimitMessage(result.Stderr));
+            else if (!routine || watch.ElapsedMilliseconds > 5000) DiagnosticLog.Write("info", summary);
+            return result;
         }
         catch (Exception ex)
         {
+            DiagnosticLog.Write("warning", $"{Path.GetFileName(executable)} {string.Join(' ', args)} 失败，{watch.ElapsedMilliseconds} ms：{ex.GetType().Name} {ex.Message}");
             KillCommand(process);
             if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
             if (deadline.IsCancellationRequested) throw new TimeoutException($"{Path.GetFileName(executable)} 执行超时（{timeout.TotalSeconds:0} 秒）。", ex);

@@ -24,6 +24,7 @@
 | POST | `/api/emulators/{index}/auto-stop` | `{ "durationMinutes": 60 }`；null 取消倒计时 |
 | POST | `/api/emulators/{index}/action` | `{ "action": "show" }`；show/hide/home/back |
 | GET | `/api/emulators/{index}/thumbnail?size=320` | 实时画面 JPEG，经 MuMu 渲染器接口读取；size 为长边像素 64–1280，默认 320 |
+| GET | `/api/emulators/{index}/capture` | 原始分辨率 PNG，用于保存画面；渲染器接口优先，失败时回退 ADB 截图 |
 | GET | `/api/emulators/{index}/screenshot` | 真实 PNG，按需获取；全局最多一个抓取 |
 | POST | `/api/tasks` | 创建计划 |
 | PUT | `/api/tasks/{id}` | 更新计划 |

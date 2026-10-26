@@ -118,7 +118,11 @@ public sealed class AppEngine : IAsyncDisposable
                     await TickAsync(_shutdown.Token);
                 }
                 catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { break; }
-                catch (Exception ex) { Log("error", "后台任务：" + ex.Message); }
+                catch (Exception ex)
+                {
+                    Log("error", "后台任务：" + ex.Message);
+                    DiagnosticLog.Write("error", "后台任务异常", ex);
+                }
             } while (await timer.WaitForNextTickAsync(_shutdown.Token));
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested) { }
@@ -175,6 +179,7 @@ public sealed class AppEngine : IAsyncDisposable
                     _connectionError = ex.Message;
                 }
                 if (changed) Log("error", ex.Message);
+                DiagnosticLog.WriteThrottled("refresh-failure", TimeSpan.FromMinutes(5), "error", "读取 MuMu 状态失败", ex);
             }
     }
 
@@ -311,6 +316,7 @@ public sealed class AppEngine : IAsyncDisposable
                     var retry = timer with { Attempts = attempts, RetryAt = now.AddSeconds(Math.Min(300, 15 * attempts)) };
                     await CommitAsync(_document with { AutoStops = _document.AutoStops.Select(a => a.VmIndex == timer.VmIndex ? retry : a).ToList() }, ct);
                     Log("error", $"#{timer.VmIndex} 自动停止失败，稍后重试：{ex.Message}");
+                    DiagnosticLog.Write("error", $"#{timer.VmIndex} 自动停止异常（第 {attempts} 次）", ex);
                 }
             }
             foreach (var task in _document.Tasks.Where(t => t.Enabled && t.NextRunAt <= now).ToArray())
@@ -336,6 +342,7 @@ public sealed class AppEngine : IAsyncDisposable
                 {
                     await ReplaceTaskAsync(claimed with { LastResult = "执行失败：" + ex.Message }, ct);
                     Log("error", $"#{task.VmIndex} 计划失败：{ex.Message}");
+                    DiagnosticLog.Write("error", $"#{task.VmIndex} 计划任务 {task.Id} 异常", ex);
                 }
             }
         }
@@ -414,8 +421,11 @@ public sealed class AppEngine : IAsyncDisposable
         foreach (var index in _unverifiedTimerRetryAt.Keys.Where(index => !document.AutoStops.Any(a => a.VmIndex == index)).ToArray())
             _unverifiedTimerRetryAt.Remove(index);
     }
+    public void LogWarning(string message) => Log("warning", message);
     private void Log(string level, string message)
     {
+        // Every activity entry is mirrored to diagnostics.log so both files share one timeline.
+        DiagnosticLog.Write(level, "[活动] " + message);
         var entry = new LogEntry(_clock.GetUtcNow(), level, message);
         lock (_viewLock)
         {

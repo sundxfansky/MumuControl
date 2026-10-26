@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
+using MumuControl.Core;
 using Microsoft.Web.WebView2.WinForms;
 
 namespace MumuControl;
@@ -9,7 +10,8 @@ namespace MumuControl;
 /// <summary>The native window hosts exactly the same local page as the browser.</summary>
 public static class DesktopHost
 {
-    public static void Run(Uri serverUri, Func<bool> closeToTray, Action requestExit, bool startMinimized = false)
+    /// <summary>Runs the window loop; returns why it ended, for the diagnostics log.</summary>
+    public static string Run(Uri serverUri, Func<bool> closeToTray, Action requestExit, bool startMinimized = false)
     {
         ArgumentNullException.ThrowIfNull(serverUri);
         ArgumentNullException.ThrowIfNull(closeToTray);
@@ -22,6 +24,7 @@ public static class DesktopHost
         Application.SetCompatibleTextRenderingDefault(false);
         using var window = new ControlWindow(serverUri, closeToTray, requestExit, startMinimized);
         Application.Run(window);
+        return window.ExitReason;
     }
 
     private sealed class ControlWindow : Form
@@ -43,6 +46,7 @@ public static class DesktopHost
         private bool _restoreAfterInitialization;
         private bool _exitRequested;
         private bool _exiting;
+        public string ExitReason { get; private set; } = "窗口消息循环结束";
 
         public ControlWindow(Uri serverUri, Func<bool> closeToTray, Action requestExit, bool startMinimized)
         {
@@ -121,7 +125,7 @@ public static class DesktopHost
             Shown += async (_, _) => await EnsureBrowserAsync();
             Resize += (_, _) =>
             {
-                if (WindowState == FormWindowState.Minimized) ReleaseBrowser();
+                if (WindowState == FormWindowState.Minimized) { if (_webView is not null) DiagnosticLog.Write("info", "窗口最小化，释放页面"); ReleaseBrowser(); }
                 else if (Visible) QueueBrowserRestore();
             };
         }
@@ -193,9 +197,32 @@ public static class DesktopHost
                     else OpenOfficialLink(e.Uri);
                 };
                 core.PermissionRequested += (_, e) => e.State = CoreWebView2PermissionState.Deny;
-                core.DownloadStarting += (_, e) => e.Cancel = true;
-                core.ProcessFailed += (_, _) =>
+                // Only page-generated captures (blob: from this origin) may be saved, into Pictures\MuMuControl.
+                core.DownloadStarting += (_, e) =>
                 {
+                    if (!IsCaptureDownload(e.DownloadOperation.Uri, e.ResultFilePath))
+                    {
+                        e.Cancel = true;
+                        DiagnosticLog.Write("warning", "已拦截非画面下载");
+                        return;
+                    }
+                    try
+                    {
+                        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MuMuControl");
+                        Directory.CreateDirectory(folder);
+                        e.ResultFilePath = Path.Combine(folder, Path.GetFileName(e.ResultFilePath));
+                        e.Handled = true; // suppress the download tray; the page shows its own notice
+                        DiagnosticLog.Write("info", "保存画面到 " + e.ResultFilePath);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        e.Cancel = true;
+                        DiagnosticLog.Write("error", "保存画面失败", ex);
+                    }
+                };
+                core.ProcessFailed += (_, e) =>
+                {
+                    DiagnosticLog.Write("error", $"WebView2 进程故障：{e.ProcessFailedKind}，原因 {e.Reason}，退出码 {e.ExitCode}，{e.ProcessDescription}");
                     if (IsDisposed || _exiting || generation != _generation) return;
                     BeginInvoke(new Action(() =>
                     {
@@ -207,6 +234,7 @@ public static class DesktopHost
                 {
                     if (e.IsSuccess || generation != _generation || _exiting) return;
                     var status = e.WebErrorStatus;
+                    DiagnosticLog.Write("warning", "桌面页面加载失败：" + status);
                     BeginInvoke(new Action(() =>
                     {
                         if (generation == _generation && !_exiting)
@@ -215,9 +243,11 @@ public static class DesktopHost
                 };
                 _browserPanel.BringToFront();
                 core.Navigate(_serverUri.AbsoluteUri);
+                DiagnosticLog.Write("info", $"桌面页面已创建（WebView2 {environment.BrowserVersionString}）");
             }
             catch (Exception error) when (error is not OutOfMemoryException)
             {
+                DiagnosticLog.Write("error", "桌面页面创建失败", error);
                 if (_exiting || generation != _generation || IsDisposed) return;
                 ShowBrowserFailure("桌面页面暂时无法打开。请确认已安装 Microsoft Edge WebView2 运行时。" + Environment.NewLine + error.Message);
                 OpenBrowser(_serverUri);
@@ -236,6 +266,11 @@ public static class DesktopHost
             && uri.Scheme == _serverUri.Scheme
             && uri.Host == _serverUri.Host
             && uri.Port == _serverUri.Port;
+
+        private bool IsCaptureDownload(string address, string resultPath) =>
+            address.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+            && IsLocalAddress(address[5..])
+            && Path.GetExtension(resultPath).Equals(".png", StringComparison.OrdinalIgnoreCase);
 
         private void OpenOfficialLink(string address)
         {
@@ -283,6 +318,8 @@ public static class DesktopHost
         {
             if (_exiting) return;
             _exiting = true;
+            ExitReason = "托盘菜单“退出”";
+            DiagnosticLog.Write("info", "用户从托盘菜单退出");
             RequestServerExit();
             Close();
         }
@@ -301,9 +338,22 @@ public static class DesktopHost
                 e.Cancel = true;
                 Hide();
                 ReleaseBrowser();
+                DiagnosticLog.Write("info", "窗口已收起到托盘");
             }
             else
             {
+                if (!_exiting)
+                {
+                    // WindowsShutDown = logoff/shutdown/restart; TaskManagerClosing = ended from Task Manager.
+                    ExitReason = e.CloseReason switch
+                    {
+                        CloseReason.UserClosing => "用户关闭窗口（未开启收起到托盘）",
+                        CloseReason.WindowsShutDown => "Windows 注销、关机或重启",
+                        CloseReason.TaskManagerClosing => "任务管理器结束",
+                        _ => "窗口关闭：" + e.CloseReason
+                    };
+                    DiagnosticLog.Write("info", "窗口关闭，程序退出：" + ExitReason);
+                }
                 _exiting = true;
                 RequestServerExit();
             }

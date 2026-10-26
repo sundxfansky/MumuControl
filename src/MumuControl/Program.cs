@@ -36,9 +36,32 @@ internal static class Program
             return 1;
         }
     }
+    private static void InstallCrashHandlers(bool headless)
+    {
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            DiagnosticLog.Write("fatal", $"未处理异常，进程即将终止（IsTerminating={e.IsTerminating}）", e.ExceptionObject as Exception);
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => DiagnosticLog.Write("info", "ProcessExit 事件");
+        // Fire-and-forget tasks must never silently tear the process down.
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            DiagnosticLog.Write("error", "未观察到的后台任务异常（已忽略）", e.Exception);
+            e.SetObserved();
+        };
+        if (headless) return;
+        // Exceptions in WinForms/WebView2 event handlers would otherwise end the whole program,
+        // including the scheduler. Log them and keep running.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => DiagnosticLog.Write("error", "界面线程异常（已恢复，程序继续运行）", e.Exception);
+    }
+
     private static int Run(Dictionary<string, string> options, string dataDir, bool headless)
     {
+        var previous = DiagnosticLog.Start(dataDir, headless ? "headless" : options.ContainsKey("--start-minimized") ? "tray" : "desktop");
+        InstallCrashHandlers(headless);
         var engine = new AppEngine(new MuMuClient(), new StateStore(dataDir));
+        if (previous is not null)
+            engine.LogWarning($"检测到上次运行未正常退出（最后存活于 {previous.LastSeenAt.ToLocalTime():MM-dd HH:mm}），详情见数据目录 diagnostics.log。");
+        string exitReason = "未知";
         LocalServer? server = null;
         using var shutdown = new ManualResetEventSlim();
         ConsoleCancelEventHandler cancel = (_, e) => { e.Cancel = true; shutdown.Set(); };
@@ -55,19 +78,32 @@ internal static class Program
             try { server.StartAsync().GetAwaiter().GetResult(); }
             catch (IOException ex) { throw new IOException($"本地端口 {port} 无法监听，可能已被占用。请使用 --port 指定其他端口。", ex); }
             engine.Start();
+            DiagnosticLog.Write("info", $"本地服务已监听 {server.Address}");
             if (headless)
             {
                 Console.WriteLine("MuMu Control: " + server.Address);
                 shutdown.Wait();
+                exitReason = "收到 Ctrl+C";
             }
-            else DesktopHost.Run(server.Address, () => engine.Settings.CloseToTray, shutdown.Set, options.ContainsKey("--start-minimized"));
+            else exitReason = DesktopHost.Run(server.Address, () => engine.Settings.CloseToTray, shutdown.Set, options.ContainsKey("--start-minimized"));
             return 0;
+        }
+        catch (Exception ex)
+        {
+            exitReason = "启动或运行失败：" + ex.Message;
+            DiagnosticLog.Write("fatal", "主流程异常", ex);
+            throw;
         }
         finally
         {
             Console.CancelKeyPress -= cancel;
-            if (server is not null) server.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            try
+            {
+                if (server is not null) server.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+            catch (Exception ex) { DiagnosticLog.Write("error", "退出清理异常", ex); }
+            DiagnosticLog.Stop(exitReason);
         }
     }
 }

@@ -64,6 +64,7 @@ public sealed class LocalServer : IAsyncDisposable
     public async Task StartAsync(CancellationToken ct = default)
     {
         await _app.StartAsync(ct);
+        DiagnosticLog.Write("info", $"远程访问：{(_access.RemoteEnabled ? "已启用，端口 " + _access.RemotePort : "关闭")}");
         if (_access.RemoteEnabled)
         {
             try { await StartRemoteAsync(_access.RemotePort, ct); }
@@ -225,6 +226,21 @@ public sealed class LocalServer : IAsyncDisposable
                     response.ContentLength = bytes.Length;
                     await response.Body.WriteAsync(bytes, ct); return;
                 }
+                if (request.Method == "GET" && parts[3] == "capture")
+                {
+                    // Full-resolution PNG for saving: renderer frame first, ADB screencap as fallback.
+                    byte[] bytes;
+                    try { bytes = EncodePng(await _engine.ThumbnailAsync(index, 4096, ct)); }
+                    catch (Exception ex) when (ex is InvalidOperationException or FileNotFoundException or TimeoutException or NotSupportedException or DllNotFoundException)
+                    {
+                        DiagnosticLog.Write("warning", $"#{index} 保存画面改用 ADB 截图：{ex.Message}");
+                        bytes = await _engine.ScreenshotAsync(index, ct);
+                    }
+                    DiagnosticLog.Write("info", $"#{index} 生成保存画面 {bytes.Length / 1024} KB（来源 {ip}）");
+                    response.ContentType = "image/png";
+                    response.ContentLength = bytes.Length;
+                    await response.Body.WriteAsync(bytes, ct); return;
+                }
                 if (request.Method == "GET" && parts[3] == "screenshot")
                 {
                     var bytes = await _engine.ScreenshotAsync(index, ct);
@@ -262,6 +278,9 @@ public sealed class LocalServer : IAsyncDisposable
                 _ => 500
             };
             if (code == 429) response.Headers.RetryAfter = "900";
+            if (code == 500) DiagnosticLog.Write("error", $"{request.Method} {request.Path} 内部错误（来源 {ip}）", ex);
+            else if (code is 409 or 504 && !request.Path.Value!.EndsWith("/thumbnail", StringComparison.Ordinal))
+                DiagnosticLog.Write("warning", $"{request.Method} {request.Path} → {code}：{ex.Message}");
             await ErrorAsync(context, code, code == 500 ? "服务暂时无法处理该请求，请在本机查看配置。" : ex.Message);
         }
         finally { requestBudget.Release(); }
@@ -280,9 +299,9 @@ public sealed class LocalServer : IAsyncDisposable
         _frames[key] = new CachedFrame(DateTime.UtcNow, jpeg);
         return jpeg;
     }
-    private static byte[] EncodeJpeg(RawFrame frame, long quality)
+    private static Bitmap ToBitmap(RawFrame frame)
     {
-        using var bitmap = new Bitmap(frame.Width, frame.Height, PixelFormat.Format32bppRgb);
+        var bitmap = new Bitmap(frame.Width, frame.Height, PixelFormat.Format32bppRgb);
         var data = bitmap.LockBits(new Rectangle(0, 0, frame.Width, frame.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
         try
         {
@@ -290,6 +309,18 @@ public sealed class LocalServer : IAsyncDisposable
                 Marshal.Copy(frame.Bgra, y * frame.Width * 4, data.Scan0 + y * data.Stride, frame.Width * 4);
         }
         finally { bitmap.UnlockBits(data); }
+        return bitmap;
+    }
+    private static byte[] EncodePng(RawFrame frame)
+    {
+        using var bitmap = ToBitmap(frame);
+        using var output = new MemoryStream();
+        bitmap.Save(output, ImageFormat.Png);
+        return output.ToArray();
+    }
+    private static byte[] EncodeJpeg(RawFrame frame, long quality)
+    {
+        using var bitmap = ToBitmap(frame);
         using var parameters = new EncoderParameters(1);
         parameters.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
         using var output = new MemoryStream();

@@ -30,6 +30,7 @@
     trash: ['M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7'],
     minimize: ['M4 12h16'], home: ['m3 10 9-8 9 8M5 9v12h5v-7h4v7h5V9'],
     'arrow-left': ['M20 12H4m7-7-7 7 7 7'], pause: ['M8 4v16M16 4v16'],
+    download: ['M12 3v12M7 10l5 5 5-5', 'M4 17v3h16v-3'],
   };
   function icon(name) {
     const svg = document.createElementNS(NS, 'svg');
@@ -162,7 +163,10 @@
       visual.append(el('span', `status-badge ${d.status}`, statusLabels[d.status] || '状态未知'));
       if (running) { const monogram = el('span', 'device-monogram', 'mumu'); monogram.setAttribute('aria-hidden', 'true'); visual.append(monogram, thumbFor(d)); }
       else { const off = el('div', 'device-visual-stopped'); off.append(icon('power'), el('span', '', busy ? '处理中' : '等待下一次出发')); visual.append(off); }
-      if (running) visual.append(button('查看实际画面', 'preview-launch', 'monitor', () => openPreview(d)));
+      if (running) {
+        visual.append(button('查看实际画面', 'preview-launch', 'monitor', () => openPreview(d)));
+        const save = button('', 'thumb-save', 'download', () => saveCapture(d, save)); save.title = '保存当前画面（原始分辨率 PNG）'; save.setAttribute('aria-label', `保存 ${d.name} 的当前画面`); visual.append(save);
+      }
       const body = el('div', 'device-body'), info = el('div', 'device-info'), name = el('div');
       const heading = el('h3', 'device-name', d.name || `MuMu 模拟器 ${d.index}`); heading.title = d.name || '';
       name.append(heading, el('span', 'device-id', d.adbPort ? `ADB · 127.0.0.1:${d.adbPort}` : `MuMu Player · 实例 ${d.index}`));
@@ -226,6 +230,27 @@
     await Promise.allSettled(work); scheduleThumbs();
   }
   function stopThumbs() { clearTimeout(thumbTimer); thumbTimer = 0; for (const key of [...thumbs.keys()]) dropThumb(key); }
+  function captureFileName(d) {
+    const now = new Date(), pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const name = String(d.name || 'MuMu').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim().slice(0, 60) || 'MuMu';
+    return `${name}-#${d.index}-${stamp}.png`;
+  }
+  // Saves a fresh full-resolution frame, not the downscaled thumbnail on screen.
+  async function saveCapture(d, trigger) {
+    if (demo) { toast('演示模式不能保存模拟器画面。'); return; }
+    if (trigger) trigger.disabled = true;
+    try {
+      const response = await fetch(`/api/emulators/${encodeURIComponent(d.index)}/capture?t=${Date.now()}`, { cache: 'no-store' });
+      if (response.status === 401) { auth.authenticated = false; token = ''; setAuthGate('login', '会话已结束，请重新登录。'); return; }
+      if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || '无法获取画面，请确认模拟器已完成启动。'); }
+      const blob = await response.blob(); if (!blob.type.startsWith('image/')) throw new Error('画面接口未返回图片。');
+      const url = URL.createObjectURL(blob), link = el('a'); link.href = url; link.download = captureFileName(d);
+      document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast(`已保存画面：${link.download}`);
+    } catch (error) { toast(error.message, true); }
+    finally { if (trigger) trigger.disabled = false; }
+  }
   async function runDevice(d, action, durationMinutes) {
     const key = String(d.index); if (pending.has(key)) return;
     pending.add(key); renderDevices();
@@ -424,6 +449,7 @@
   $('device-set-timer').addEventListener('click', () => updateTimer(false)); $('device-cancel-timer').addEventListener('click', () => updateTimer(true));
   document.querySelectorAll('[data-vm-action]').forEach((b) => b.addEventListener('click', async () => { if (!selectedDevice) return; b.disabled = true; try { await mutation(`/api/emulators/${encodeURIComponent(selectedDevice.index)}/action`, { action: b.dataset.vmAction }); if (!demo) toast('操作指令已发送'); } catch (error) { toast(error.message, true); } finally { b.disabled = false; } }));
   $('preview-dialog').addEventListener('close', () => { if (!$('preview-dialog').open) stopPreview(); }); $('preview-refresh').addEventListener('click', refreshPreview);
+  $('preview-save').addEventListener('click', () => { if (previewDevice) saveCapture(previewDevice, $('preview-save')); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) { cancelPreview(); clearTimeout(thumbTimer); } else { refreshState(); if (previewDevice) refreshPreview(); scheduleThumbs(0); } schedulePoll(); });
   window.addEventListener('pagehide', () => { clearTimeout(pollTimer); stopPreview(); stopThumbs(); });
   async function init() {
