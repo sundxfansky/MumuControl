@@ -31,6 +31,9 @@
     minimize: ['M4 12h16'], home: ['m3 10 9-8 9 8M5 9v12h5v-7h4v7h5V9'],
     'arrow-left': ['M20 12H4m7-7-7 7 7 7'], pause: ['M8 4v16M16 4v16'],
     download: ['M12 3v12M7 10l5 5 5-5', 'M4 17v3h16v-3'],
+    upload: ['M12 15V3M7 8l5-5 5 5', 'M4 17v3h16v-3'],
+    package: ['m12 2 9 5v10l-9 5-9-5V7Z', 'm3 7 9 5 9-5M12 12v10'],
+    folder: ['M3 6a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z'],
   };
   function icon(name) {
     const svg = document.createElementNS(NS, 'svg');
@@ -155,6 +158,7 @@
     setConnection(Boolean(state.connection.connected), state.connection.error);
     fillDeviceSelect('quick-device');
     if (!$('task-dialog').open) fillDeviceSelect('task-device');
+    if ($('apk-dialog').open && !$('apk-setup').classList.contains('hidden')) fillApkTargets();
     document.querySelectorAll('[data-quick]').forEach((b) => b.disabled = !state.emulators.length);
     renderDevices(); renderUpcoming(); renderTasks();
     if (firstSettings || !settingsDirty) populateSettings(); renderAccess();
@@ -332,7 +336,7 @@
     $('task-trigger').value = 'once'; $('task-time').type = 'datetime-local'; $('task-time').value = localInputDate(new Date(Date.now() + 5 * 60000));
     $('task-time').min = localInputDate(new Date()); $('task-dialog').showModal();
   }
-  function openDevice(d) { selectedDevice = d; $('device-dialog-name').textContent = `${d.name} · #${d.index}`; const running = d.status === 'running'; document.querySelectorAll('[data-vm-action]').forEach((b) => b.disabled = !running); $('device-set-timer').disabled = !running; $('device-cancel-timer').disabled = !running || !d.autoStopAt; $('device-dialog').showModal(); }
+  function openDevice(d) { selectedDevice = d; $('device-dialog-name').textContent = `${d.name} · #${d.index}`; const running = d.status === 'running'; document.querySelectorAll('[data-vm-action]').forEach((b) => b.disabled = !running); $('device-install-apk').disabled = !running; $('device-set-timer').disabled = !running; $('device-cancel-timer').disabled = !running || !d.autoStopAt; $('device-dialog').showModal(); }
   async function updateTimer(cancel) {
     if (!selectedDevice) return; const duration = Number($('device-stop-duration').value);
     if (!cancel && (!Number.isInteger(duration) || duration < 1 || duration > 10080)) { toast('请输入 1 至 10080 之间的整数分钟数。', true); return; }
@@ -346,6 +350,120 @@
       for (const log of [...logs].sort((a, b) => (safeDate(b.at)?.getTime() || 0) - (safeDate(a.at)?.getTime() || 0))) { const row = el('div', 'log-row'), visual = el('span', `log-indicator${log.level === 'error' ? ' error' : ''}`); visual.append(icon(log.level === 'error' ? 'info' : 'check')); row.append(visual, el('div', 'log-message', log.message), el('time', 'log-time', dateText(log.at))); container.append(row); }
     } catch (error) { $('log-list').replaceChildren(emptyState('暂时无法读取记录', error.message)); }
   }
+  // Batch APK install: the job runs on the server, the dialog only follows it.
+  let apkJobId = null, apkTimer = 0, apkBusy = false;
+  const apkItemLabels = { pending: '等待中', installing: '安装中…', success: '安装成功', failed: '失败' };
+  function sizeText(bytes) { return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(0, Math.round((bytes || 0) / 1024))} KB`; }
+  function apkSource() { return document.querySelector('input[name="apk-source"]:checked')?.value || 'upload'; }
+  function showApkSource() { const source = apkSource(); document.querySelectorAll('[data-apk-source]').forEach((p) => p.classList.toggle('hidden', p.dataset.apkSource !== source)); }
+  function fillApkTargets(preselect) {
+    const container = $('apk-targets'), checked = new Set([...container.querySelectorAll('input:checked')].map((i) => i.value));
+    if (preselect !== undefined) { checked.clear(); checked.add(String(preselect)); }
+    container.replaceChildren();
+    const running = state.emulators.filter((d) => d.status === 'running');
+    if (!running.length) container.append(el('p', 'muted-empty', '没有运行中的模拟器。请先启动并等待 Android 完成启动。'));
+    for (const d of running) {
+      const label = el('label', 'apk-target'), input = el('input'); input.type = 'checkbox'; input.value = d.index; input.checked = checked.has(String(d.index));
+      input.addEventListener('change', syncApkAll); label.append(input, el('span', '', `${d.name} · #${d.index}`)); container.append(label);
+    }
+    syncApkAll();
+  }
+  function syncApkAll() { const boxes = [...$('apk-targets').querySelectorAll('input')]; $('apk-select-all').checked = boxes.length > 0 && boxes.every((b) => b.checked); $('apk-select-all').disabled = !boxes.length; }
+  function apkView(progress) {
+    $('apk-setup').classList.toggle('hidden', progress); $('apk-progress').classList.toggle('hidden', !progress);
+    $('apk-submit').classList.toggle('hidden', progress); $('apk-again').classList.toggle('hidden', !progress);
+  }
+  function apkProgress(name, phase, fraction, error = '') {
+    $('apk-progress-name').textContent = name; $('apk-progress-phase').textContent = phase;
+    $('apk-bar-fill').style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`;
+    $('apk-progress-error').textContent = error; $('apk-progress-error').classList.toggle('hidden', !error);
+  }
+  function renderApkJob(job) {
+    const items = job.items || [], finished = items.filter((i) => i.status === 'success' || i.status === 'failed').length, ok = items.filter((i) => i.status === 'success').length;
+    let phase, fraction;
+    if (job.phase === 'preparing') {
+      const received = job.receivedBytes || 0, total = job.totalBytes;
+      phase = job.source === 'url' ? (total ? `下载中 ${sizeText(received)} / ${sizeText(total)}` : `下载中 ${sizeText(received)}`) : '准备文件…';
+      fraction = total ? received / total : 0;
+    } else if (job.phase === 'installing') { phase = `安装中 ${finished}/${items.length}`; fraction = items.length ? finished / items.length : 0; }
+    else { phase = job.error ? '未完成' : `完成：成功 ${ok} 个，失败 ${items.length - ok} 个`; fraction = 1; }
+    apkProgress(job.fileName, phase, fraction, job.error || '');
+    $('apk-bar-fill').classList.toggle('failed', job.phase === 'done' && (Boolean(job.error) || ok < items.length));
+    const list = $('apk-results'); list.replaceChildren();
+    for (const item of items) {
+      const row = el('li', `apk-result ${item.status}`); row.append(el('span', 'apk-result-name', `${item.name} · #${item.index}`), el('span', 'apk-result-state', apkItemLabels[item.status] || item.status));
+      if (item.message) row.append(el('small', '', item.message)); list.append(row);
+    }
+  }
+  async function pollApk() {
+    clearTimeout(apkTimer); apkTimer = 0;
+    if (!apkJobId || demo) return;
+    try {
+      const data = await api('/api/apk/jobs', { timeout: 10000 }), job = (data.jobs || []).find((j) => j.id === apkJobId);
+      if (!job) { apkJobId = null; apkBusy = false; return; }
+      if ($('apk-dialog').open) renderApkJob(job);
+      if (job.phase === 'done') {
+        const ok = job.items.filter((i) => i.status === 'success').length;
+        if (!$('apk-dialog').open) toast(job.error ? `APK 安装未完成：${job.error}` : `${job.fileName} 安装完成：成功 ${ok}/${job.items.length}`, Boolean(job.error) || ok < job.items.length);
+        apkJobId = null; apkBusy = false; return;
+      }
+    } catch { /* transient; keep following the job */ }
+    apkTimer = setTimeout(pollApk, 1000);
+  }
+  async function openApk(preselect) {
+    $('apk-source-path-option').classList.toggle('hidden', !auth.local && !demo);
+    if (!auth.local && apkSource() === 'path') document.querySelector('input[name="apk-source"][value="upload"]').checked = true;
+    showApkSource(); fillApkTargets(preselect);
+    if (!apkJobId && !demo) {
+      // Re-attach to a batch started earlier (another tab, or before the dialog was closed).
+      try { const data = await api('/api/apk/jobs', { timeout: 10000 }); const active = data.active && (data.jobs || []).find((j) => j.phase !== 'done'); if (active) { apkJobId = active.id; apkBusy = true; } } catch { }
+    }
+    apkView(Boolean(apkJobId || apkBusy)); if (!$('apk-dialog').open) $('apk-dialog').showModal();
+    if (apkJobId) pollApk();
+  }
+  function uploadApk(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest(); xhr.open('POST', '/api/apk/upload');
+      xhr.setRequestHeader('Content-Type', 'application/vnd.android.package-archive'); xhr.setRequestHeader('Accept', 'application/json');
+      xhr.setRequestHeader('X-Mumu-Token', token); xhr.setRequestHeader('X-Apk-Name', encodeURIComponent(file.name));
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+      xhr.onload = () => { let data = {}; try { data = JSON.parse(xhr.responseText); } catch { } if (xhr.status === 401) { auth.authenticated = false; token = ''; setAuthGate('login', '会话已结束，请重新登录。'); } if (xhr.status >= 200 && xhr.status < 300) resolve(data); else reject(new Error(data.error || `上传失败（${xhr.status}）`)); };
+      xhr.onerror = () => reject(new Error('上传中断，请检查网络后重试。')); xhr.send(file);
+    });
+  }
+  $('apk-form').addEventListener('submit', async (event) => {
+    event.preventDefault(); if (apkBusy) return;
+    const indexes = [...$('apk-targets').querySelectorAll('input:checked')].map((i) => Number(i.value));
+    if (!indexes.length) { toast('请至少选择一个运行中的模拟器。', true); return; }
+    const source = apkSource(), body = { indexes, source };
+    let file = null;
+    if (source === 'upload') { file = $('apk-file').files[0]; if (!file) { toast('请选择 APK 文件。', true); return; } if (!/\.apk$/i.test(file.name)) { toast('请选择 .apk 文件。', true); return; } }
+    if (source === 'url') { body.url = $('apk-url').value.trim(); try { if (!['http:', 'https:'].includes(new URL(body.url).protocol)) throw new Error(); } catch { toast('请输入有效的 HTTP 或 HTTPS 下载地址。', true); return; } }
+    if (source === 'path') { body.path = $('apk-path').value.trim().replace(/^"|"$/g, ''); if (!body.path) { toast('请填写 APK 文件路径。', true); return; } }
+    if (demo) { toast('当前是界面演示模式，不会安装 APK。'); return; }
+    apkBusy = true; $('apk-submit').disabled = true;
+    try {
+      if (!token) token = (await api('/api/bootstrap')).token;
+      if (file) {
+        apkView(true); $('apk-results').replaceChildren(); $('apk-bar-fill').classList.remove('failed'); apkProgress(file.name, '上传中 0%', 0);
+        const uploaded = await uploadApk(file, (loaded, total) => apkProgress(file.name, `上传中 ${Math.round(loaded / total * 100)}%`, loaded / total));
+        body.uploadId = uploaded.uploadId;
+      }
+      const job = await api('/api/apk/install', { method: 'POST', body, timeout: 30000 });
+      apkJobId = job.id; apkView(true); renderApkJob(job); pollApk();
+    } catch (error) { apkBusy = false; apkView(false); toast(error.message, true); }
+    finally { $('apk-submit').disabled = false; }
+  });
+  document.querySelectorAll('input[name="apk-source"]').forEach((input) => input.addEventListener('change', showApkSource));
+  $('apk-select-all').addEventListener('change', () => { $('apk-targets').querySelectorAll('input').forEach((b) => { b.checked = $('apk-select-all').checked; }); });
+  $('apk-again').addEventListener('click', () => { if (apkBusy) { toast('当前安装尚未完成。', true); return; } $('apk-file').value = ''; apkView(false); fillApkTargets(); });
+  $('apk-browse').addEventListener('click', async () => {
+    const b = $('apk-browse'); b.disabled = true;
+    try { if (!token) token = (await api('/api/bootstrap')).token; const picked = await api('/api/apk/browse', { method: 'POST', body: {}, timeout: 600000 }); if (picked.path) $('apk-path').value = picked.path; }
+    catch (error) { toast(error.message, true); } finally { b.disabled = false; }
+  });
+  document.querySelectorAll('[data-action="open-apk"]').forEach((b) => b.addEventListener('click', () => openApk()));
+  $('device-install-apk').addEventListener('click', () => { const d = selectedDevice; $('device-dialog').close(); if (d) openApk(d.index); });
   function previewMessage(message) { const n = $('preview-message'); n.replaceChildren(icon('monitor'), el('p', '', message)); n.classList.remove('hidden'); }
   function clearPreviewImage() { const img = $('preview-image'); img.onload = null; img.onerror = null; img.removeAttribute('src'); img.classList.add('hidden'); if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl); previewObjectUrl = null; }
   function cancelPreview() {

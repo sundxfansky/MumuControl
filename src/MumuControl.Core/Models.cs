@@ -12,6 +12,30 @@ public interface IMuMuClient : IDisposable
     /// <summary>Low-cost live frame from the renderer, longer side at most maxSide pixels.</summary>
     Task<RawFrame> ThumbnailAsync(string managerPath, VmInfo vm, int maxSide, CancellationToken ct = default) =>
         throw new NotSupportedException("当前接口不支持实时画面。");
+    /// <summary>Installs (or replaces) an APK on one running instance; throws with the reason on failure.</summary>
+    Task InstallApkAsync(string managerPath, VmInfo vm, string apkPath, CancellationToken ct = default) =>
+        throw new NotSupportedException("当前接口不支持安装 APK。");
+}
+
+/// <summary>Produces the local APK file for a batch install (download, copy or an already staged upload).</summary>
+public delegate Task<string> ApkPreparer(Action<long, long?> progress, CancellationToken ct);
+
+public sealed record ApkInstallItem(int Index, string Name, string Status, string? Message = null);
+
+public sealed record ApkInstallJob
+{
+    public string Id { get; init; } = "";
+    public string FileName { get; init; } = "";
+    /// <summary>upload, url or path.</summary>
+    public string Source { get; init; } = "";
+    /// <summary>preparing, installing or done.</summary>
+    public string Phase { get; init; } = "preparing";
+    public long? ReceivedBytes { get; init; }
+    public long? TotalBytes { get; init; }
+    public string? Error { get; init; }
+    public DateTimeOffset StartedAt { get; init; }
+    public DateTimeOffset? FinishedAt { get; init; }
+    public IReadOnlyList<ApkInstallItem> Items { get; init; } = [];
 }
 
 public sealed record AppSettings

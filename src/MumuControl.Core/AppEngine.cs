@@ -56,6 +56,8 @@ public sealed class AppEngine : IAsyncDisposable
     private DateTimeOffset? _updatedAt;
     private DateTimeOffset _nextPoll = DateTimeOffset.MinValue;
     private Task? _worker;
+    private Task? _apkWorker;
+    private readonly List<ApkInstallJob> _apkJobs = [];
 
     public AppEngine(IMuMuClient client, StateStore store, TimeProvider? clock = null)
     {
@@ -414,6 +416,111 @@ public sealed class AppEngine : IAsyncDisposable
         return _client.ThumbnailAsync(path, vm, maxSide, ct);
     }
 
+    public object GetApkJobs() { lock (_viewLock) return new { active = _apkWorker is { IsCompleted: false }, jobs = _apkJobs.AsEnumerable().Reverse().ToArray() }; }
+    public ApkInstallJob GetApkJob(string id)
+    {
+        lock (_viewLock) return _apkJobs.FirstOrDefault(j => j.Id == id) ?? throw new KeyNotFoundException("安装任务不存在。");
+    }
+
+    /// <summary>
+    /// Installs one APK on several running instances in the background. Only one batch runs at a time;
+    /// installs never hold the scheduler gate, so timers and tasks keep running during long installs.
+    /// </summary>
+    public ApkInstallJob StartApkInstall(IReadOnlyList<int> indexes, string fileName, string source, ApkPreparer prepare, Action? cleanup = null)
+    {
+        var distinct = indexes.Distinct().ToArray();
+        if (distinct.Length == 0) throw new ArgumentException("请至少选择一个模拟器。");
+        if (distinct.Length > 200) throw new ArgumentException("一次最多选择 200 个模拟器。");
+        ApkInstallJob job;
+        lock (_viewLock)
+        {
+            if (_shutdown.IsCancellationRequested) throw new InvalidOperationException("程序正在退出。");
+            if (_apkWorker is { IsCompleted: false }) throw new InvalidOperationException("已有 APK 安装任务正在进行，请等待完成后再试。");
+            if (!_connected) throw new InvalidOperationException("MuMu 未连接，请先检查设置并刷新。");
+            var items = new List<ApkInstallItem>();
+            foreach (var index in distinct)
+            {
+                var vm = _vms.FirstOrDefault(v => v.Index == index) ?? throw new ArgumentException($"未找到模拟器 #{index}，请刷新列表。");
+                if (vm.Status != "running") throw new InvalidOperationException($"#{index} {vm.Name} 未在运行，请先启动并等待 Android 完成启动。");
+                items.Add(new(index, vm.Name, "pending"));
+            }
+            job = new ApkInstallJob
+            {
+                Id = Guid.NewGuid().ToString("N"), FileName = fileName, Source = source,
+                StartedAt = _clock.GetUtcNow(), Items = items
+            };
+            _apkJobs.Add(job);
+            while (_apkJobs.Count > 10) _apkJobs.RemoveAt(0);
+            _apkWorker = Task.Run(() => RunApkInstallAsync(job.Id, prepare, cleanup));
+        }
+        Log("info", $"开始安装 APK「{fileName}」到 {distinct.Length} 个模拟器。");
+        return job;
+    }
+
+    private async Task RunApkInstallAsync(string id, ApkPreparer prepare, Action? cleanup)
+    {
+        var ct = _shutdown.Token;
+        try
+        {
+            var path = await prepare((received, total) => UpdateApkJob(id, j => j with { ReceivedBytes = received, TotalBytes = total }), ct);
+            UpdateApkJob(id, j => j with { Phase = "installing" });
+            var items = GetApkJob(id).Items;
+            await Parallel.ForEachAsync(items, new ParallelOptions { MaxDegreeOfParallelism = 3, CancellationToken = ct }, async (item, token) =>
+            {
+                SetApkItem(id, item.Index, "installing", null);
+                try
+                {
+                    VmInfo vm;
+                    string manager;
+                    lock (_viewLock)
+                    {
+                        // The instance may have stopped while the APK was downloading.
+                        vm = _vms.FirstOrDefault(v => v.Index == item.Index) ?? throw new InvalidOperationException("模拟器已不存在。");
+                        manager = _document.Settings.ManagerPath;
+                    }
+                    if (vm.Status != "running") throw new InvalidOperationException("模拟器未在运行。");
+                    await _client.InstallApkAsync(manager, vm, path, token);
+                    SetApkItem(id, item.Index, "success", null);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    SetApkItem(id, item.Index, "failed", ex.Message);
+                    DiagnosticLog.Write("warning", $"#{item.Index} 安装 APK 失败：{ex.Message}");
+                }
+            });
+            var done = GetApkJob(id);
+            int ok = done.Items.Count(i => i.Status == "success");
+            Log(ok == done.Items.Count ? "info" : "error", $"APK「{done.FileName}」安装完成：成功 {ok} 个，失败 {done.Items.Count - ok} 个。");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            UpdateApkJob(id, j => j with { Error = "程序退出，安装已中止。" });
+        }
+        catch (Exception ex)
+        {
+            UpdateApkJob(id, j => j with { Error = ex.Message, Items = j.Items.Select(i => i.Status == "pending" ? i with { Status = "failed", Message = "未执行" } : i).ToArray() });
+            Log("error", $"APK 安装失败：{ex.Message}");
+            DiagnosticLog.Write("error", "APK 安装任务异常", ex);
+        }
+        finally
+        {
+            try { cleanup?.Invoke(); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { DiagnosticLog.Write("warning", "清理 APK 临时文件失败：" + ex.Message); }
+            UpdateApkJob(id, j => j with { Phase = "done", FinishedAt = _clock.GetUtcNow() });
+        }
+    }
+    private void UpdateApkJob(string id, Func<ApkInstallJob, ApkInstallJob> change)
+    {
+        lock (_viewLock)
+        {
+            var position = _apkJobs.FindIndex(j => j.Id == id);
+            if (position >= 0) _apkJobs[position] = change(_apkJobs[position]);
+        }
+    }
+    private void SetApkItem(string id, int index, string status, string? message) =>
+        UpdateApkJob(id, j => j with { Items = j.Items.Select(i => i.Index == index ? i with { Status = status, Message = message } : i).ToArray() });
+
     private async Task CommitAsync(StateDocument document, CancellationToken ct)
     {
         await _store.SaveAsync(document, ct);
@@ -446,6 +553,9 @@ public sealed class AppEngine : IAsyncDisposable
     {
         _shutdown.Cancel();
         if (_worker is not null) await _worker;
+        Task? apkWorker;
+        lock (_viewLock) apkWorker = _apkWorker;
+        if (apkWorker is not null) await apkWorker;
         // HTTP server is stopped before this point, so no new operations can enter.
         await _gate.WaitAsync();
         await _captureGate.WaitAsync();

@@ -21,6 +21,7 @@ public sealed class LocalServer : IAsyncDisposable
     private readonly WebApplication _app;
     private readonly AppEngine _engine;
     private readonly AccessSecurity _access;
+    private readonly string _dataDirectory;
     // Separate budgets prevent slow remote uploads or password hashing from starving
     // the local emergency controls used to disable remote access.
     private readonly SemaphoreSlim _localRequests = new(16, 16);
@@ -34,7 +35,11 @@ public sealed class LocalServer : IAsyncDisposable
     public LocalServer(AppEngine engine, int port, string dataDirectory)
     {
         _engine = engine;
+        _dataDirectory = dataDirectory;
         _access = new AccessSecurity(dataDirectory, port);
+        // Uploads and downloads left over from an earlier run can never be claimed again.
+        try { if (Directory.Exists(StagingDirectory)) Directory.Delete(StagingDirectory, recursive: true); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { DiagnosticLog.Write("warning", "清理 APK 临时目录失败：" + ex.Message); }
         Address = new Uri($"http://127.0.0.1:{port}/");
         if (_access.RemotePort == port) throw new ArgumentException("本机端口和远程端口不能相同。");
         _app = BuildServer(port, remote: false);
@@ -101,8 +106,10 @@ public sealed class LocalServer : IAsyncDisposable
         { await ErrorAsync(context, 403, "拒绝跨站请求。"); return; }
         if (request.Method is not ("GET" or "POST" or "PUT" or "DELETE"))
         { await ErrorAsync(context, 405, "不支持该请求方式。"); return; }
-        if (request.Method is "POST" or "PUT" && !request.HasJsonContentType())
-        { await ErrorAsync(context, 415, "请求必须使用 JSON。"); return; }
+        // The APK upload is the only binary request; it is still CSRF-protected by the session token below.
+        bool apkUpload = request.Path.Value == "/api/apk/upload" && request.Method == "POST";
+        if (request.Method is "POST" or "PUT" && !(apkUpload ? request.ContentType is "application/vnd.android.package-archive" or "application/octet-stream" : request.HasJsonContentType()))
+        { await ErrorAsync(context, 415, apkUpload ? "请上传 APK 文件。" : "请求必须使用 JSON。"); return; }
         var requestBudget = remote ? _remoteRequests : _localRequests;
         if (!await requestBudget.WaitAsync(0, request.HttpContext.RequestAborted))
         { await ErrorAsync(context, 429, "操作过于频繁，请稍后重试。"); return; }
@@ -156,7 +163,7 @@ public sealed class LocalServer : IAsyncDisposable
                 await response.WriteAsJsonAsync(new { ok = true }); return;
             }
             if (path is "/api/auth/settings" or "/api/access" or "/api/auth/credentials" or "/api/auth/certificate" or "/api/startup"
-                || path == "/api/settings")
+                || path is "/api/settings" or "/api/apk/browse")
             {
                 if (!local) { await ErrorAsync(context, 403, "此设置只能在运行程序的本机管理。"); return; }
             }
@@ -204,6 +211,14 @@ public sealed class LocalServer : IAsyncDisposable
                     case "/api/health": await response.WriteAsJsonAsync(new { status = "ok", version = "1.1.1" }, ct); return;
                 }
             }
+            if (path == "/api/apk/browse" && request.Method == "POST")
+            { await response.WriteAsJsonAsync(new { path = await BrowseApkAsync() }, ct); return; }
+            if (path == "/api/apk/jobs" && request.Method == "GET")
+            { await response.WriteAsJsonAsync(_engine.GetApkJobs(), ct); return; }
+            if (apkUpload)
+            { await response.WriteAsJsonAsync(await UploadApkAsync(context, ip), CancellationToken.None); return; }
+            if (path == "/api/apk/install" && request.Method == "POST")
+            { await response.WriteAsJsonAsync(StartApkInstall(await BodyAsync<ApkInstallInput>(request, ct), local, ip), ct); return; }
             if (path == "/api/refresh" && request.Method == "POST")
             { await _engine.RefreshAsync(ct); await response.WriteAsJsonAsync(_engine.GetState(local), ct); return; }
             if (path == "/api/settings" && request.Method == "PUT")
@@ -331,6 +346,200 @@ public sealed class LocalServer : IAsyncDisposable
         bitmap.Save(output, JpegCodec, parameters);
         return output.ToArray();
     }
+    private const long MaxApkBytes = 4L * 1024 * 1024 * 1024;
+    private static readonly byte[] ZipSignature = [0x50, 0x4B, 0x03, 0x04];
+    private sealed record StagedApk(string Path, string FileName, long Size, DateTimeOffset ExpiresAt);
+    private readonly ConcurrentDictionary<string, StagedApk> _staged = new();
+    private string StagingDirectory => Path.Combine(_dataDirectory, "apk-staging");
+    private static readonly HttpClient Downloader = CreateDownloader();
+
+    /// <summary>Downloads may follow redirects, but never connect to this computer or link-local addresses.</summary>
+    private static HttpClient CreateDownloader()
+    {
+        var handler = new SocketsHttpHandler
+        {
+            AllowAutoRedirect = true,
+            MaxAutomaticRedirections = 5,
+            ConnectTimeout = TimeSpan.FromSeconds(15),
+            ConnectCallback = async (context, ct) =>
+            {
+                var addresses = await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, ct);
+                var allowed = addresses.Where(a => !BlockedDownloadAddress(a)).ToArray();
+                if (allowed.Length == 0) throw new HttpRequestException("下载地址指向本机或不允许访问的网络地址。");
+                var socket = new System.Net.Sockets.Socket(System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(allowed, context.DnsEndPoint.Port, ct);
+                    return new System.Net.Sockets.NetworkStream(socket, ownsSocket: true);
+                }
+                catch { socket.Dispose(); throw; }
+            }
+        };
+        var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("MuMuControl/1.1.1");
+        return client;
+    }
+    private static bool BlockedDownloadAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any)) return true;
+        if (address.IsIPv6LinkLocal || address.IsIPv6Multicast) return true;
+        var bytes = address.GetAddressBytes();
+        return address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && (bytes[0] == 169 && bytes[1] == 254 || bytes[0] >= 224 || bytes[0] == 0)
+            || AccessSecurity.LocalAddresses().Contains(address);
+    }
+
+    private static string SafeApkName(string? name)
+    {
+        name = Path.GetFileName((name ?? "").Trim()).Trim();
+        name = new string(name.Select(c => char.IsControl(c) || Path.GetInvalidFileNameChars().Contains(c) ? '_' : c).ToArray());
+        if (name.Length == 0) name = "app.apk";
+        if (!name.EndsWith(".apk", StringComparison.OrdinalIgnoreCase)) name += ".apk";
+        return name.Length <= 120 ? name : name[..116] + ".apk";
+    }
+    private static async Task EnsureApkSignatureAsync(string path, CancellationToken ct)
+    {
+        var header = new byte[4];
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (await stream.ReadAtLeastAsync(header, 4, false, ct) < 4 || !header.AsSpan().SequenceEqual(ZipSignature))
+            throw new ArgumentException("文件不是有效的 APK（ZIP）格式。");
+    }
+    private static void DeleteQuietly(string path)
+    {
+        try { File.Delete(path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { DiagnosticLog.Write("warning", "删除 APK 临时文件失败：" + ex.Message); }
+    }
+    private void PruneStaged()
+    {
+        foreach (var (id, staged) in _staged)
+            if (staged.ExpiresAt <= DateTimeOffset.UtcNow && _staged.TryRemove(id, out _)) DeleteQuietly(staged.Path);
+    }
+
+    /// <summary>Streams the request body straight to disk; uploads are staged until an install claims them.</summary>
+    private async Task<object> UploadApkAsync(HttpContext context, string ip)
+    {
+        PruneStaged();
+        if (_staged.Count >= 4) throw new InvalidOperationException("待安装的上传文件过多，请先安装或稍后重试。");
+        var request = context.Request;
+        if (context.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } limit)
+            limit.MaxRequestBodySize = MaxApkBytes;
+        if (request.ContentLength is null or <= 0) throw new ArgumentException("上传内容为空。");
+        if (request.ContentLength > MaxApkBytes) throw new ArgumentException("APK 文件不能超过 4 GB。");
+        var fileName = SafeApkName(Uri.UnescapeDataString(request.Headers["X-Apk-Name"].ToString()));
+        Directory.CreateDirectory(StagingDirectory);
+        var id = Guid.NewGuid().ToString("N");
+        var path = Path.Combine(StagingDirectory, id + ".apk");
+        try
+        {
+            await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous))
+                await request.Body.CopyToAsync(file, 128 * 1024, context.RequestAborted);
+            var size = new FileInfo(path).Length;
+            if (size != request.ContentLength) throw new ArgumentException("上传未完成，请重试。");
+            await EnsureApkSignatureAsync(path, context.RequestAborted);
+            _staged[id] = new StagedApk(path, fileName, size, DateTimeOffset.UtcNow.AddMinutes(30));
+            DiagnosticLog.Write("info", $"已接收 APK 上传「{fileName}」{size / 1024} KB（来源 {ip}）");
+            return new { uploadId = id, fileName, size };
+        }
+        catch { DeleteQuietly(path); throw; }
+    }
+
+    private object StartApkInstall(ApkInstallInput input, bool local, string ip)
+    {
+        var indexes = input.Indexes ?? [];
+        switch (input.Source)
+        {
+            case "upload":
+            {
+                if (string.IsNullOrEmpty(input.UploadId) || !_staged.TryRemove(input.UploadId, out var staged))
+                    throw new ArgumentException("上传的文件已失效，请重新选择文件。");
+                try
+                {
+                    return _engine.StartApkInstall(indexes, staged.FileName, "upload", (_, _) => Task.FromResult(staged.Path), () => File.Delete(staged.Path));
+                }
+                catch { _staged[input.UploadId] = staged; throw; }
+            }
+            case "url":
+            {
+                if (!Uri.TryCreate(input.Url?.Trim(), UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length > 0)
+                    throw new ArgumentException("请输入有效的 HTTP 或 HTTPS 下载地址。");
+                Directory.CreateDirectory(StagingDirectory);
+                var path = Path.Combine(StagingDirectory, Guid.NewGuid().ToString("N") + ".apk");
+                var fileName = SafeApkName(Uri.UnescapeDataString(uri.Segments.LastOrDefault() ?? ""));
+                DiagnosticLog.Write("info", $"APK 下载请求 {uri.GetLeftPart(UriPartial.Path)}（来源 {ip}）");
+                return _engine.StartApkInstall(indexes, fileName, "url", (progress, ct) => DownloadApkAsync(uri, path, progress, ct), () => { if (File.Exists(path)) File.Delete(path); });
+            }
+            case "path":
+            {
+                if (!local) throw new UnauthorizedAccessException("本机文件路径只能在运行程序的电脑上使用。");
+                var raw = (input.Path ?? "").Trim().Trim('"');
+                if (raw.Length is 0 or > 1024 || !Path.IsPathFullyQualified(raw)) throw new ArgumentException("请填写 APK 文件的完整路径。");
+                var full = Path.GetFullPath(raw);
+                if (!full.EndsWith(".apk", StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) throw new ArgumentException("找不到该 APK 文件。");
+                return _engine.StartApkInstall(indexes, Path.GetFileName(full), "path", async (_, ct) => { await EnsureApkSignatureAsync(full, ct); return full; });
+            }
+            default: throw new ArgumentException("请选择 APK 来源。");
+        }
+    }
+
+    private static async Task<string> DownloadApkAsync(Uri uri, string path, Action<long, long?> progress, CancellationToken ct)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromMinutes(30));
+        try
+        {
+            using var response = await Downloader.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"下载失败：服务器返回 {(int)response.StatusCode}。");
+            long? total = response.Content.Headers.ContentLength;
+            if (total > MaxApkBytes) throw new InvalidOperationException("APK 文件不能超过 4 GB。");
+            await using (var source = await response.Content.ReadAsStreamAsync(deadline.Token))
+            await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous))
+            {
+                var buffer = new byte[128 * 1024];
+                long received = 0, reported = 0;
+                int count;
+                while ((count = await source.ReadAsync(buffer, deadline.Token)) > 0)
+                {
+                    received += count;
+                    if (received > MaxApkBytes) throw new InvalidOperationException("APK 文件不能超过 4 GB。");
+                    await file.WriteAsync(buffer.AsMemory(0, count), deadline.Token);
+                    if (received - reported >= 512 * 1024) { progress(received, total); reported = received; }
+                }
+                progress(received, total);
+                if (total is {} expected && received != expected) throw new InvalidOperationException("下载未完成，连接已中断。");
+            }
+            await EnsureApkSignatureAsync(path, deadline.Token);
+            return path;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException("下载超时（30 分钟）。"); }
+        catch (HttpRequestException ex) { throw new InvalidOperationException("下载失败：" + ex.Message, ex); }
+    }
+
+    /// <summary>Shows a native file picker on this computer; only the loopback entry may call it.</summary>
+    private static Task<string?> BrowseApkAsync()
+    {
+        var result = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var owner = new System.Windows.Forms.Form { TopMost = true, ShowInTaskbar = false, Opacity = 0, StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen };
+                owner.Show();
+                owner.Activate();
+                using var dialog = new System.Windows.Forms.OpenFileDialog
+                {
+                    Title = "选择要安装的 APK", Filter = "Android 安装包 (*.apk)|*.apk", CheckFileExists = true, Multiselect = false
+                };
+                result.TrySetResult(dialog.ShowDialog(owner) == System.Windows.Forms.DialogResult.OK ? dialog.FileName : null);
+            }
+            catch (Exception ex) { result.TrySetException(ex); }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
+        thread.Start();
+        return result.Task;
+    }
+
+    private sealed record ApkInstallInput(int[]? Indexes, string? Source, string? UploadId = null, string? Url = null, string? Path = null);
     private sealed record ControlInput(int? DurationMinutes = null, string? Action = null);
     private sealed record LoginInput(string? Username, string? Password);
     private sealed record SetupInput(string? Username, string? Password, bool RemoteEnabled = false);

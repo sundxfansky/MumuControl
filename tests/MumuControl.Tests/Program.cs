@@ -24,6 +24,8 @@ var cases = new List<(string Name, Func<Task> Run)>
     ("Countdown survives app restart before PID is known", Tests.RestoredUnconfirmedTimer),
     ("Missing PID does not block a due countdown", Tests.MissingPidBackoff),
     ("Unknown emulator uptime remains null", Tests.UnknownUptime),
+    ("Batch APK install reports per-instance results", Tests.ApkInstall),
+    ("APK install rejects stopped instances and concurrent batches", Tests.ApkInstallGuards),
     ("Renderer frames are flipped upright and downscaled", () => { Tests.ThumbnailFlip(); return Task.CompletedTask; })
 };
 if (args.Contains("--live", StringComparer.Ordinal)) cases.Add(("Read-only installed MuMuManager integration", Tests.LiveList));
@@ -40,6 +42,51 @@ return failures == 0 ? 0 : 1;
 
 internal static class Tests
 {
+    public static async Task ApkInstall()
+    {
+        await using var fixture = await Fixture.Create(running: true);
+        var cleaned = false;
+        var job = fixture.Engine.StartApkInstall([2, 2], "demo.apk", "path", (progress, _) => { progress(10, 10); return Task.FromResult("fake.apk"); }, () => cleaned = true);
+        Equal(1, job.Items.Count);
+        var done = await WaitApk(fixture.Engine, job.Id);
+        Equal("success", done.Items.Single().Status);
+        True(cleaned, "Temporary APK must be cleaned up.");
+        Equal("fake.apk", fixture.Client.Installed.Single().Path);
+        fixture.Client.InstallFailure = new InvalidOperationException("安装失败：INSTALL_FAILED_NO_MATCHING_ABIS");
+        var failed = await WaitApk(fixture.Engine, fixture.Engine.StartApkInstall([2], "demo.apk", "path", (_, _) => Task.FromResult("fake.apk")).Id);
+        Equal("failed", failed.Items.Single().Status);
+        True(failed.Items.Single().Message!.Contains("NO_MATCHING_ABIS"), "Failure reason must be reported.");
+        var prepFailed = await WaitApk(fixture.Engine, fixture.Engine.StartApkInstall([2], "demo.apk", "url", (_, _) => throw new InvalidOperationException("下载失败")).Id);
+        Equal("下载失败", prepFailed.Error);
+        Equal("failed", prepFailed.Items.Single().Status);
+    }
+
+    public static async Task ApkInstallGuards()
+    {
+        await using var fixture = await Fixture.Create(running: false);
+        Throws<InvalidOperationException>(() => fixture.Engine.StartApkInstall([2], "a.apk", "path", (_, _) => Task.FromResult("a.apk")));
+        Throws<ArgumentException>(() => fixture.Engine.StartApkInstall([], "a.apk", "path", (_, _) => Task.FromResult("a.apk")));
+        Throws<ArgumentException>(() => fixture.Engine.StartApkInstall([9], "a.apk", "path", (_, _) => Task.FromResult("a.apk")));
+        await fixture.Engine.ControlAsync(2, "start");
+        await fixture.Engine.RefreshAsync();
+        var gate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var job = fixture.Engine.StartApkInstall([2], "a.apk", "path", (_, _) => gate.Task);
+        Throws<InvalidOperationException>(() => fixture.Engine.StartApkInstall([2], "b.apk", "path", (_, _) => Task.FromResult("b.apk")));
+        gate.SetResult("a.apk");
+        Equal("success", (await WaitApk(fixture.Engine, job.Id)).Items.Single().Status);
+    }
+
+    private static async Task<ApkInstallJob> WaitApk(AppEngine engine, string id)
+    {
+        for (int i = 0; i < 500; i++)
+        {
+            var job = engine.GetApkJob(id);
+            if (job.Phase == "done") return job;
+            await Task.Delay(10);
+        }
+        throw new TimeoutException("APK job did not finish.");
+    }
+
     public static Task ParseDictionary()
     {
         var list = MuMuClient.ParseInfo("""
@@ -532,5 +579,13 @@ internal sealed class FakeMuMuClient(TestClock clock, bool running) : IMuMuClien
         return Task.CompletedTask;
     }
     public Task<byte[]> ScreenshotAsync(string managerPath, VmInfo vm, CancellationToken ct = default) => throw new NotSupportedException();
+    public List<(int Index, string Path)> Installed { get; } = [];
+    public Exception? InstallFailure { get; set; }
+    public Task InstallApkAsync(string managerPath, VmInfo vm, string apkPath, CancellationToken ct = default)
+    {
+        if (InstallFailure is {} error) throw error;
+        lock (Installed) Installed.Add((vm.Index, apkPath));
+        return Task.CompletedTask;
+    }
     public void Dispose() { }
 }

@@ -31,6 +31,10 @@
 | DELETE | `/api/tasks/{id}` | 删除计划 |
 | GET/PUT | `/api/settings` | 仅本机已登录，端口变更下次启动生效 |
 | GET | `/api/logs` | 最多 200 条运行记录 |
+| POST | `/api/apk/upload` | 请求体为 APK 原始字节，`Content-Type: application/vnd.android.package-archive` 或 `application/octet-stream`，文件名放在 URL 编码的 `X-Apk-Name`；最大 4 GB，校验 ZIP 头；返回 `{uploadId,fileName,size}`，30 分钟内未使用即失效 |
+| POST | `/api/apk/install` | `{indexes:[0,1],source:"upload"|"url"|"path",uploadId?,url?,path?}`；目标须为运行中实例；`path` 仅本机；`url` 由本机下载，拒绝回环、链路本地与本机网卡地址。同一时间只运行一批，返回任务对象 |
+| GET | `/api/apk/jobs` | 最近 10 个安装任务：`phase` 为 preparing/installing/done，`items[].status` 为 pending/installing/success/failed，附失败原因 |
+| POST | `/api/apk/browse` | 仅本机；在本机弹出文件选择框，返回 `{path}`（取消时为 null） |
 
 计划格式：
 

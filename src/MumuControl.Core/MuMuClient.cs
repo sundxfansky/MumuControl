@@ -193,6 +193,32 @@ public sealed class MuMuClient : IMuMuClient
         return _renderer.CaptureAsync(ValidateManagerPath(managerPath), vm, Math.Clamp(maxSide, 64, 4096), ct);
     }
 
+    public async Task InstallApkAsync(string managerPath, VmInfo vm, string apkPath, CancellationToken ct = default)
+    {
+        ThrowIfDisposed();
+        if (vm.Status != "running") throw new InvalidOperationException("模拟器尚未启动完成，无法安装 APK。");
+        if (vm.AdbPort is < 1 or > 65535) throw new InvalidOperationException("模拟器尚未提供有效的 ADB 端口。");
+        if (!File.Exists(apkPath)) throw new FileNotFoundException("APK 文件不存在。", apkPath);
+        // Same host-forwarded endpoint as screenshots; adb connect is idempotent and keeps other devices.
+        var endpoint = $"127.0.0.1:{vm.AdbPort}";
+        var adb = DiscoverAdb(ValidateManagerPath(managerPath));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        var connect = await RunAsync(adb, ["connect", endpoint], TimeSpan.FromSeconds(8), 64 * 1024, linked.Token).ConfigureAwait(false);
+        EnsureExitSuccess(connect, "连接模拟器");
+        var connectOutput = Utf8.GetString(connect.Stdout);
+        if (!connectOutput.Contains("connected to", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"ADB 连接失败：{LimitMessage(connectOutput + " " + connect.Stderr)}");
+        // -r replaces an installed copy, -d permits version downgrades within the same signature.
+        var install = await RunAsync(adb, ["-s", endpoint, "install", "-r", "-d", Path.GetFullPath(apkPath)],
+            TimeSpan.FromMinutes(5), 256 * 1024, linked.Token).ConfigureAwait(false);
+        var output = (Utf8.GetString(install.Stdout) + " " + install.Stderr).Trim();
+        if (install.ExitCode != 0 || !output.Contains("Success", StringComparison.Ordinal))
+        {
+            var failure = System.Text.RegularExpressions.Regex.Match(output, @"Failure \[[^\]]+\]|INSTALL_[A-Z_]+");
+            throw new InvalidOperationException($"安装失败：{LimitMessage(failure.Success ? failure.Value : output)}");
+        }
+    }
+
     /// <summary>Accepts current dictionary results, older arrays, and nested data/results envelopes.</summary>
     public static IReadOnlyList<VmInfo> ParseInfo(string json)
     {
@@ -360,7 +386,7 @@ public sealed class MuMuClient : IMuMuClient
         var stderr = ReadBoundedAsync(process.StandardError.BaseStream, 64 * 1024, process, deadline.Token);
         var watch = Stopwatch.StartNew();
         // Status polls and screenshots repeat constantly; only control commands are logged every time.
-        bool routine = args.Count > 0 && args[0] is "info" or "-s" or "connect";
+        bool routine = args.Count > 0 && args[0] is "info" or "-s" or "connect" && !args.Contains("install");
         try
         {
             await Task.WhenAll(stdout, stderr, process.WaitForExitAsync(deadline.Token)).ConfigureAwait(false);
